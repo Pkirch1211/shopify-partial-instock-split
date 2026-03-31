@@ -64,6 +64,13 @@ MAX_RETRIES = int(os.getenv("MAX_RETRIES", "4").strip())
 if not SHOPIFY_SHOP or not SHOPIFY_TOKEN or not SHOPIFY_LOCATION_ID:
     raise ValueError("Missing SHOPIFY_SHOP, SHOPIFY_TOKEN, or SHOPIFY_LOCATION_ID")
 
+if not DRAFT_ORDER_NAMES:
+    raise ValueError(
+        "DRAFT_ORDER_NAMES is not set. This script will not run open-ended. "
+        "Set DRAFT_ORDER_NAMES to a comma-separated list of draft order names (e.g. #D123,#D124) "
+        "to explicitly scope which drafts are processed."
+    )
+
 BASE_URL = f"https://{SHOPIFY_SHOP}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
 HEADERS = {
     "Content-Type": "application/json",
@@ -296,14 +303,16 @@ query GetDraftOrders($cursor: String, $query: String!) {
       name
       tags
       poNumber
-      note
       note2
       customAttributes {
         key
         value
       }
       purchasingEntity {
-        company {
+        ... on PurchasingCompany {
+          company {
+            id
+          }
           location {
             id
           }
@@ -352,10 +361,9 @@ query GetDraftOrders($cursor: String, $query: String!) {
       reserveInventoryUntil
       visibleToCustomer
       paymentTerms {
-        paymentTermsTemplate {
-          id
-          name
-        }
+        id
+        paymentTermsName
+        paymentTermsType
       }
       metafields(first: 100) {
         nodes {
@@ -840,9 +848,8 @@ def build_child_draft_input(
         "lineItems": [build_line_payload(line) for line in available_lines],
         "tags": tags,
         "poNumber": child_po,
-        # note2 is a read-only field on DraftOrder; it cannot be set via DraftOrderInput.
-        # Only "note" is writable. We copy the parent's note to the child.
-        "note": parent.get("note") or None,
+        # DraftOrder exposes the note as `note2` (read). DraftOrderInput accepts `note` (write).
+        "note": parent.get("note2") or None,
         "visibleToCustomer": bool(parent.get("visibleToCustomer")),
         "metafields": build_child_metafields(parent, child_po),
     }
@@ -870,21 +877,19 @@ def build_child_draft_input(
     company_location_id = get_nested(
         parent,
         "purchasingEntity",
-        "company",
         "location",
         "id",
     )
     if company_location_id:
         input_payload["purchasingEntity"] = {"companyLocationId": company_location_id}
 
-    payment_terms_template = get_nested(
+    payment_terms_id = get_nested(
         parent,
         "paymentTerms",
-        "paymentTermsTemplate",
         "id",
     )
-    if payment_terms_template:
-        input_payload["paymentTermsId"] = payment_terms_template
+    if payment_terms_id:
+        input_payload["paymentTerms"] = {"paymentTermsTemplateId": payment_terms_id}
 
     if parent.get("reserveInventoryUntil"):
         input_payload["reserveInventoryUntil"] = parent["reserveInventoryUntil"]
