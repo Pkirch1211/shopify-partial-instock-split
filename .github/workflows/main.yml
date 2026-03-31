@@ -1,0 +1,68 @@
+
+---
+
+### `.github/workflows/partial-instock-split.yml`
+
+```yaml id="yml1"
+name: Partial In-Stock Split
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/30 12-21 * * 1-5"
+
+permissions:
+  contents: write
+
+jobs:
+  partial-instock-split:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run partial in-stock split
+        env:
+          SHOPIFY_SHOP: ${{ secrets.SHOPIFY_SHOP }}
+          SHOPIFY_TOKEN: ${{ secrets.SHOPIFY_TOKEN }}
+          SHOPIFY_LOCATION_ID: ${{ vars.SHOPIFY_LOCATION_ID }}
+          SHOPIFY_API_VERSION: ${{ vars.SHOPIFY_API_VERSION }}
+          DRY_RUN: ${{ vars.DRY_RUN }}
+          MIN_AVAILABLE_LINES: ${{ vars.MIN_AVAILABLE_LINES }}
+          MIN_AVAILABLE_VALUE: ${{ vars.MIN_AVAILABLE_VALUE }}
+          MIN_AVAILABLE_PERCENT: ${{ vars.MIN_AVAILABLE_PERCENT }}
+          MAX_SPLIT_DEPTH: ${{ vars.MAX_SPLIT_DEPTH }}
+          PARTIAL_PARENT_TAG: ${{ vars.PARTIAL_PARENT_TAG }}
+          PARTIAL_CHILD_TAG: ${{ vars.PARTIAL_CHILD_TAG }}
+          PROCESSING_TAG: ${{ vars.PROCESSING_TAG }}
+          READY_TAG: ${{ vars.READY_TAG }}
+          NEEDS_REVIEW_TAG: ${{ vars.NEEDS_REVIEW_TAG }}
+          SUBMITTED_TAG: ${{ vars.SUBMITTED_TAG }}
+          LINEAGE_NAMESPACE: ${{ vars.LINEAGE_NAMESPACE }}
+          DRAFT_ORDER_NAMES: ${{ vars.DRAFT_ORDER_NAMES }}
+          CSV_LOG_PATH: logs/partial_instock_split_history.csv
+        run: python partial-instock-split.py
+
+      - name: Upload CSV log artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: partial-instock-split-log
+          path: logs/partial_instock_split_history.csv
+          if-no-files-found: ignore
+
+      - name: Commit updated CSV log
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add logs/partial_instock_split_history.csv
+          git diff --cached --quiet || git commit -m "Update partial instock split log"
+          git push
