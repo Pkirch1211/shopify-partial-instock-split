@@ -787,7 +787,7 @@ def build_child_metafields(parent: Dict[str, Any], child_po: str) -> List[Dict[s
 
 def build_child_draft_input(parent: Dict[str, Any], available_lines: List[Dict[str, Any]], child_po: str) -> Dict[str, Any]:
     tags = normalize_tags(parent.get("tags", []))
-    tags = remove_tags(tags, PROCESSING_TAG, READY_TAG, PARTIAL_PARENT_TAG)
+    tags = remove_tags(tags, PROCESSING_TAG, PARTIAL_PARENT_TAG)
     tags = add_tags(tags, PARTIAL_CHILD_TAG)
 
     input_payload: Dict[str, Any] = {
@@ -845,7 +845,7 @@ def build_child_draft_input(parent: Dict[str, Any], available_lines: List[Dict[s
 
 def build_parent_update_payload(parent: Dict[str, Any], remaining_lines: List[Dict[str, Any]]) -> Dict[str, Any]:
     tags = normalize_tags(parent.get("tags", []))
-    tags = remove_tags(tags, PROCESSING_TAG, READY_TAG)
+    tags = remove_tags(tags, PROCESSING_TAG)
     tags = add_tags(tags, PARTIAL_PARENT_TAG)
     return {
         "lineItems": [build_line_payload(line) for line in remaining_lines],
