@@ -28,8 +28,8 @@ jobs:
         env:
           SHOPIFY_SHOP: ${{ secrets.SHOPIFY_SHOP }}
           SHOPIFY_TOKEN: ${{ secrets.SHOPIFY_TOKEN }}
-          SHOPIFY_LOCATION_ID: ${{ vars.SHOPIFY_LOCATION_ID }}
-          SHOPIFY_API_VERSION: ${{ vars.SHOPIFY_API_VERSION }}
+          SHOPIFY_LOCATION_ID: ${{ secrets.SHOPIFY_LOCATION_ID }}
+          SHOPIFY_API_VERSION: ${{ secrets.SHOPIFY_API_VERSION }}
           DRY_RUN: ${{ vars.DRY_RUN }}
           MIN_AVAILABLE_LINES: ${{ vars.MIN_AVAILABLE_LINES }}
           MIN_AVAILABLE_VALUE: ${{ vars.MIN_AVAILABLE_VALUE }}
