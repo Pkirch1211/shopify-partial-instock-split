@@ -37,11 +37,15 @@ NEEDS_REVIEW_TAG = os.getenv("NEEDS_REVIEW_TAG", "needs-review").strip()
 SUBMITTED_TAG = os.getenv("SUBMITTED_TAG", "order-submitted").strip()
 LINEAGE_NAMESPACE = os.getenv("LINEAGE_NAMESPACE", "automation").strip()
 
-DRAFT_ORDER_NAMES = {
-    x.strip()
-    for x in os.getenv("DRAFT_ORDER_NAMES", "").split(",")
-    if x.strip()
-}
+_raw_draft_order_names = os.getenv("DRAFT_ORDER_NAMES", "").strip()
+# Set DRAFT_ORDER_NAMES=ALL to run open-ended across all eligible drafts.
+# Set to a comma-separated list (e.g. D15483,D15484) to scope to specific drafts.
+DRAFT_ORDER_NAMES_ALL = _raw_draft_order_names.upper() == "ALL"
+DRAFT_ORDER_NAMES = (
+    set()
+    if DRAFT_ORDER_NAMES_ALL
+    else {x.strip() for x in _raw_draft_order_names.split(",") if x.strip()}
+)
 
 CSV_LOG_PATH = Path(
     os.getenv("CSV_LOG_PATH", "logs/partial_instock_split_history.csv")
@@ -61,14 +65,15 @@ REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30").strip())
 SLEEP_SECONDS = float(os.getenv("SLEEP_SECONDS", "0.35").strip())
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "4").strip())
 
+ALLOW_OPEN_ENDED = os.getenv("ALLOW_OPEN_ENDED", "false").strip().lower() == "true"
+
 if not SHOPIFY_SHOP or not SHOPIFY_TOKEN or not SHOPIFY_LOCATION_ID:
     raise ValueError("Missing SHOPIFY_SHOP, SHOPIFY_TOKEN, or SHOPIFY_LOCATION_ID")
 
-if not DRAFT_ORDER_NAMES:
+if not DRAFT_ORDER_NAMES and not DRAFT_ORDER_NAMES_ALL:
     raise ValueError(
-        "DRAFT_ORDER_NAMES is not set. This script will not run open-ended. "
-        "Set DRAFT_ORDER_NAMES to a comma-separated list of draft order names (e.g. #D123,#D124) "
-        "to explicitly scope which drafts are processed."
+        "DRAFT_ORDER_NAMES is not set. Set it to a comma-separated list of draft order names "
+        "(e.g. D15483,D15484) to scope specific drafts, or set it to ALL to run open-ended."
     )
 
 BASE_URL = f"https://{SHOPIFY_SHOP}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
@@ -1085,6 +1090,7 @@ def main() -> None:
     logger.info("SHOPIFY_SHOP=%s", SHOPIFY_SHOP)
     logger.info("SHOPIFY_API_VERSION=%s", SHOPIFY_API_VERSION)
     logger.info("DRY_RUN=%s", DRY_RUN)
+    logger.info("ALLOW_OPEN_ENDED=%s", ALLOW_OPEN_ENDED)
     logger.info("MIN_AVAILABLE_LINES=%s", MIN_AVAILABLE_LINES)
     logger.info("MIN_AVAILABLE_VALUE=%s", MIN_AVAILABLE_VALUE)
     logger.info("MIN_AVAILABLE_PERCENT=%s", MIN_AVAILABLE_PERCENT)
