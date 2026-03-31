@@ -754,7 +754,7 @@ def build_child_metafields(parent: Dict[str, Any], child_po: str) -> List[Dict[s
             "namespace": LINEAGE_NAMESPACE,
             "key": "partial_split_parent_draft_id",
             "type": "single_line_text_field",
-            "value": safe_single_line_text(parent.get("id")),
+            "value": safe_single_line_text(parent.get("id"),
         },
         {
             "namespace": LINEAGE_NAMESPACE,
@@ -829,11 +829,11 @@ def build_child_draft_input(parent: Dict[str, Any], available_lines: List[Dict[s
             if v not in (None, "")
         }
 
-    company_location_id = (((parent.get("purchasingEntity") or {}).get("company") or {}).get("location") or {}).get("id"))
+    company_location_id = (((parent.get("purchasingEntity") or {}).get("company") or {}).get("location") or {}).get("id")
     if company_location_id:
         input_payload["purchasingEntity"] = {"companyLocationId": company_location_id}
 
-    payment_terms_template = (((parent.get("paymentTerms") or {}).get("paymentTermsTemplate") or {}).get("id"))
+    payment_terms_template = (((parent.get("paymentTerms") or {}).get("paymentTermsTemplate") or {}).get("id")
     if payment_terms_template:
         input_payload["paymentTermsId"] = payment_terms_template
 
@@ -869,7 +869,7 @@ def evaluate_draft(draft: Dict[str, Any], availability_by_item: Dict[str, int]) 
         line_total = unit_price * Decimal(qty)
         total_value += line_total
 
-        inventory_item_id = (((line.get("variant") or {}).get("inventoryItem") or {}).get("id"))
+        inventory_item_id = (((line.get("variant") or {}).get("inventoryItem") or {}).get("id")
         available_qty = availability_by_item.get(inventory_item_id or "", 0)
 
         snapshot = deepcopy(line)
@@ -1011,7 +1011,7 @@ def collect_inventory_ids(drafts: List[Dict[str, Any]]) -> List[str]:
     seen: Set[str] = set()
     for draft in drafts:
         for line in ((draft.get("lineItems") or {}).get("nodes") or []):
-            inv_id = (((line.get("variant") or {}).get("inventoryItem") or {}).get("id"))
+            inv_id = (((line.get("variant") or {}).get("inventoryItem") or {}).get("id")
             if inv_id and inv_id not in seen:
                 ids.append(inv_id)
                 seen.add(inv_id)
@@ -1050,7 +1050,7 @@ def main() -> None:
             processed += 1
         except Exception as exc:
             failed += 1
-            logger.exception("%s | FAILED | %s", draft.get("name", draft.get("id")), exc)
+            logger.exception("%s | FAILED | %s", draft.get("name", draft.get("id"), exc)
 
     logger.info("----- DONE -----")
     logger.info("Processed: %s", processed)
