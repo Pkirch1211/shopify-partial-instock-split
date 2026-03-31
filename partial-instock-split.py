@@ -903,16 +903,11 @@ def build_child_draft_input(
     if applied_discount_payload:
         input_payload["appliedDiscount"] = applied_discount_payload
 
-    # FIX: DraftOrderInput.purchasingEntity expects PurchasingEntityInput with
-    # { companyId, locationId } — NOT companyLocationId (which is not a valid field).
-    # Both companyId and locationId are required; skip if either is missing.
-    company_id = get_nested(parent, "purchasingEntity", "company", "id")
-    company_location_id = get_nested(parent, "purchasingEntity", "location", "id")
-    if company_id and company_location_id:
-        input_payload["purchasingEntity"] = {
-            "companyId": company_id,
-            "locationId": company_location_id,
-        }
+    # NOTE: purchasingEntity is intentionally omitted from DraftOrderInput.
+    # The Shopify API (2025-10) does not accept purchasingEntity on DraftOrderInput —
+    # neither companyLocationId nor companyId/locationId are valid fields on
+    # PurchasingEntityInput in this context. The child draft is linked to the
+    # customer directly via customerId, which is sufficient.
 
     payment_terms_id = get_nested(
         parent,
