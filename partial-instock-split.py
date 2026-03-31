@@ -682,6 +682,8 @@ def can_split_more(parent_po: str) -> Tuple[bool, str]:
     if depth >= MAX_SPLIT_DEPTH:
         return False, f"Split depth {depth} already at MAX_SPLIT_DEPTH {MAX_SPLIT_DEPTH}"
     return True, ""
+
+
 # ----------------------------
 # Draft transformation
 # ----------------------------
@@ -901,14 +903,16 @@ def build_child_draft_input(
     if applied_discount_payload:
         input_payload["appliedDiscount"] = applied_discount_payload
 
-    company_location_id = get_nested(
-        parent,
-        "purchasingEntity",
-        "location",
-        "id",
-    )
-    if company_location_id:
-        input_payload["purchasingEntity"] = {"companyLocationId": company_location_id}
+    # FIX: DraftOrderInput.purchasingEntity expects PurchasingEntityInput with
+    # { companyId, locationId } — NOT companyLocationId (which is not a valid field).
+    # Both companyId and locationId are required; skip if either is missing.
+    company_id = get_nested(parent, "purchasingEntity", "company", "id")
+    company_location_id = get_nested(parent, "purchasingEntity", "location", "id")
+    if company_id and company_location_id:
+        input_payload["purchasingEntity"] = {
+            "companyId": company_id,
+            "locationId": company_location_id,
+        }
 
     payment_terms_id = get_nested(
         parent,
