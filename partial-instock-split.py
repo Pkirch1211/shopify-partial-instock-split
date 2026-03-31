@@ -492,10 +492,10 @@ def fetch_open_drafts() -> List[Dict[str, Any]]:
         sleep_brief()
 
     if DRAFT_ORDER_NAMES:
-        target_lower = {name.lower() for name in DRAFT_ORDER_NAMES}
+        target_lower = {name.lstrip("#").lower() for name in DRAFT_ORDER_NAMES}
         filtered = [
             d for d in drafts
-            if str(d.get("name", "")).strip().lower() in target_lower
+            if str(d.get("name", "")).strip().lstrip("#").lower() in target_lower
         ]
         logger.info(
             "DRAFT_ORDER_NAMES=%s | matched %s of %s fetched draft(s)",
