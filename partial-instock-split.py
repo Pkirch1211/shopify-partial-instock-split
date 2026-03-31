@@ -43,7 +43,9 @@ DRAFT_ORDER_NAMES = {
     if x.strip()
 }
 
-CSV_LOG_PATH = Path(os.getenv("CSV_LOG_PATH", "logs/partial_instock_split_history.csv")).resolve()
+CSV_LOG_PATH = Path(
+    os.getenv("CSV_LOG_PATH", "logs/partial_instock_split_history.csv")
+).resolve()
 
 # NOTE:
 # We intentionally do NOT exclude PARTIAL_CHILD_TAG.
@@ -174,6 +176,17 @@ def parse_ship_date_value(raw_value: str) -> Optional[date]:
 
 def format_percent(value: Decimal) -> str:
     return f"{(value * Decimal('100')):.2f}"
+
+
+def get_nested(d: Dict[str, Any], *keys: str) -> Any:
+    cur: Any = d
+    for key in keys:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(key)
+        if cur is None:
+            return None
+    return cur
 
 
 # ----------------------------
@@ -472,7 +485,10 @@ def fetch_open_drafts() -> List[Dict[str, Any]]:
 
     if DRAFT_ORDER_NAMES:
         target_lower = {name.lower() for name in DRAFT_ORDER_NAMES}
-        filtered = [d for d in drafts if str(d.get("name", "")).strip().lower() in target_lower]
+        filtered = [
+            d for d in drafts
+            if str(d.get("name", "")).strip().lower() in target_lower
+        ]
         logger.info(
             "DRAFT_ORDER_NAMES=%s | matched %s of %s fetched draft(s)",
             sorted(DRAFT_ORDER_NAMES),
@@ -489,6 +505,7 @@ def fetch_open_drafts() -> List[Dict[str, Any]]:
 def fetch_inventory_availability(inventory_item_ids: Sequence[str]) -> Dict[str, int]:
     ids = [x for x in inventory_item_ids if x]
     results: Dict[str, int] = {}
+
     for batch in chunks(ids, 100):
         data = graphql(
             INVENTORY_QUERY,
@@ -505,12 +522,16 @@ def fetch_inventory_availability(inventory_item_ids: Sequence[str]) -> Dict[str,
                     break
             results[node.get("id", "")] = quantity
         sleep_brief()
+
     return results
 
 
 def get_metafield_value(draft: Dict[str, Any], namespace: str, key: str) -> Optional[str]:
     for mf in ((draft.get("metafields") or {}).get("nodes") or []):
-        if str(mf.get("namespace") or "").strip() == namespace and str(mf.get("key") or "").strip() == key:
+        if (
+            str(mf.get("namespace") or "").strip() == namespace
+            and str(mf.get("key") or "").strip() == key
+        ):
             value = mf.get("value")
             return None if value is None else str(value)
     return None
@@ -630,15 +651,31 @@ def can_split_more(parent_po: str) -> Tuple[bool, str]:
 # Draft transformation
 # ----------------------------
 def get_line_unit_price(line: Dict[str, Any]) -> Decimal:
-    price = (((line.get("originalUnitPriceWithCurrency") or {}).get("amount")))
+    price = get_nested(line, "originalUnitPriceWithCurrency", "amount")
     if price is not None:
         return to_decimal(price)
 
-    total = (((line.get("originalTotalSet") or {}).get("presentmentMoney") or {}).get("amount"))
+    total = get_nested(line, "originalTotalSet", "presentmentMoney", "amount")
     qty = int(line.get("quantity") or 0)
     if qty > 0 and total is not None:
         return to_decimal(total) / Decimal(qty)
+
     return Decimal("0")
+
+
+def build_discount_payload(discount: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not discount:
+        return None
+
+    payload = {
+        "title": discount.get("title"),
+        "description": discount.get("description"),
+        "value": discount.get("value"),
+        "valueType": discount.get("valueType"),
+        "amount": get_nested(discount, "amountV2", "amount"),
+    }
+    payload = {k: v for k, v in payload.items() if v not in (None, "")}
+    return payload or None
 
 
 def build_line_payload(line: Dict[str, Any]) -> Dict[str, Any]:
@@ -646,33 +683,31 @@ def build_line_payload(line: Dict[str, Any]) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "quantity": int(line.get("quantity") or 0),
     }
+
     if variant.get("id"):
         payload["variantId"] = variant["id"]
     else:
-        payload["title"] = line.get("title") or (variant.get("sku") or line.get("sku") or "Untitled")
+        payload["title"] = (
+            line.get("title")
+            or variant.get("sku")
+            or line.get("sku")
+            or "Untitled"
+        )
         payload["originalUnitPrice"] = str(get_line_unit_price(line))
         if line.get("sku"):
             payload["sku"] = line["sku"]
 
-    discount = line.get("appliedDiscount")
-    if discount:
-        payload["appliedDiscount"] = {
-            k: v
-            for k, v in {
-                "title": discount.get("title"),
-                "description": discount.get("description"),
-                "value": discount.get("value"),
-                "valueType": discount.get("valueType"),
-                "amount": ((discount.get("amountV2") or {}).get("amount")),
-            }.items()
-            if v not in (None, "")
-        }
+    discount_payload = build_discount_payload(line.get("appliedDiscount"))
+    if discount_payload:
+        payload["appliedDiscount"] = discount_payload
+
     return payload
 
 
 def build_address_payload(address: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not address:
         return None
+
     payload = {
         key: address.get(key)
         for key in [
@@ -695,7 +730,10 @@ def build_address_payload(address: Optional[Dict[str, Any]]) -> Optional[Dict[st
 def build_custom_attributes_payload(parent: Dict[str, Any]) -> Optional[List[Dict[str, str]]]:
     attrs = parent.get("customAttributes") or []
     payload = [
-        {"key": str(attr.get("key", "")).strip(), "value": str(attr.get("value", "")).strip()}
+        {
+            "key": str(attr.get("key", "")).strip(),
+            "value": str(attr.get("value", "")).strip(),
+        }
         for attr in attrs
         if str(attr.get("key", "")).strip()
     ]
@@ -715,6 +753,7 @@ def build_child_metafields(parent: Dict[str, Any], child_po: str) -> List[Dict[s
         key = str(mf.get("key") or "").strip()
         mf_type = str(mf.get("type") or "").strip()
         value = mf.get("value")
+
         if not namespace or not key or not mf_type or value is None:
             continue
 
@@ -754,7 +793,7 @@ def build_child_metafields(parent: Dict[str, Any], child_po: str) -> List[Dict[s
             "namespace": LINEAGE_NAMESPACE,
             "key": "partial_split_parent_draft_id",
             "type": "single_line_text_field",
-            "value": safe_single_line_text(parent.get("id"),
+            "value": safe_single_line_text(parent.get("id")),
         },
         {
             "namespace": LINEAGE_NAMESPACE,
@@ -779,13 +818,20 @@ def build_child_metafields(parent: Dict[str, Any], child_po: str) -> List[Dict[s
     for field in lineage_fields:
         key_pair = (field["namespace"], field["key"])
         if key_pair in seen_keys:
-            existing = [x for x in existing if (x["namespace"], x["key"]) != key_pair]
+            existing = [
+                x for x in existing
+                if (x["namespace"], x["key"]) != key_pair
+            ]
         existing.append(field)
 
     return existing
 
 
-def build_child_draft_input(parent: Dict[str, Any], available_lines: List[Dict[str, Any]], child_po: str) -> Dict[str, Any]:
+def build_child_draft_input(
+    parent: Dict[str, Any],
+    available_lines: List[Dict[str, Any]],
+    child_po: str,
+) -> Dict[str, Any]:
     tags = normalize_tags(parent.get("tags", []))
     tags = remove_tags(tags, PROCESSING_TAG, PARTIAL_PARENT_TAG)
     tags = add_tags(tags, PARTIAL_CHILD_TAG)
@@ -804,8 +850,9 @@ def build_child_draft_input(parent: Dict[str, Any], available_lines: List[Dict[s
     if custom_attributes:
         input_payload["customAttributes"] = custom_attributes
 
-    if parent.get("customer", {}).get("id"):
-        input_payload["customerId"] = parent["customer"]["id"]
+    customer_id = get_nested(parent, "customer", "id")
+    if customer_id:
+        input_payload["customerId"] = customer_id
 
     shipping = build_address_payload(parent.get("shippingAddress"))
     if shipping:
@@ -815,25 +862,26 @@ def build_child_draft_input(parent: Dict[str, Any], available_lines: List[Dict[s
     if billing:
         input_payload["billingAddress"] = billing
 
-    applied_discount = parent.get("appliedDiscount")
-    if applied_discount:
-        input_payload["appliedDiscount"] = {
-            k: v
-            for k, v in {
-                "title": applied_discount.get("title"),
-                "description": applied_discount.get("description"),
-                "value": applied_discount.get("value"),
-                "valueType": applied_discount.get("valueType"),
-                "amount": ((applied_discount.get("amountV2") or {}).get("amount")),
-            }.items()
-            if v not in (None, "")
-        }
+    applied_discount_payload = build_discount_payload(parent.get("appliedDiscount"))
+    if applied_discount_payload:
+        input_payload["appliedDiscount"] = applied_discount_payload
 
-    company_location_id = (((parent.get("purchasingEntity") or {}).get("company") or {}).get("location") or {}).get("id")
+    company_location_id = get_nested(
+        parent,
+        "purchasingEntity",
+        "company",
+        "location",
+        "id",
+    )
     if company_location_id:
         input_payload["purchasingEntity"] = {"companyLocationId": company_location_id}
 
-    payment_terms_template = (((parent.get("paymentTerms") or {}).get("paymentTermsTemplate") or {}).get("id")
+    payment_terms_template = get_nested(
+        parent,
+        "paymentTerms",
+        "paymentTermsTemplate",
+        "id",
+    )
     if payment_terms_template:
         input_payload["paymentTermsId"] = payment_terms_template
 
@@ -843,10 +891,14 @@ def build_child_draft_input(parent: Dict[str, Any], available_lines: List[Dict[s
     return {k: v for k, v in input_payload.items() if v is not None}
 
 
-def build_parent_update_payload(parent: Dict[str, Any], remaining_lines: List[Dict[str, Any]]) -> Dict[str, Any]:
+def build_parent_update_payload(
+    parent: Dict[str, Any],
+    remaining_lines: List[Dict[str, Any]],
+) -> Dict[str, Any]:
     tags = normalize_tags(parent.get("tags", []))
     tags = remove_tags(tags, PROCESSING_TAG)
     tags = add_tags(tags, PARTIAL_PARENT_TAG)
+
     return {
         "lineItems": [build_line_payload(line) for line in remaining_lines],
         "tags": tags,
@@ -869,7 +921,7 @@ def evaluate_draft(draft: Dict[str, Any], availability_by_item: Dict[str, int]) 
         line_total = unit_price * Decimal(qty)
         total_value += line_total
 
-        inventory_item_id = (((line.get("variant") or {}).get("inventoryItem") or {}).get("id")
+        inventory_item_id = get_nested(line, "variant", "inventoryItem", "id")
         available_qty = availability_by_item.get(inventory_item_id or "", 0)
 
         snapshot = deepcopy(line)
@@ -1009,12 +1061,14 @@ def process_draft(draft: Dict[str, Any], availability_by_item: Dict[str, int]) -
 def collect_inventory_ids(drafts: List[Dict[str, Any]]) -> List[str]:
     ids: List[str] = []
     seen: Set[str] = set()
+
     for draft in drafts:
         for line in ((draft.get("lineItems") or {}).get("nodes") or []):
-            inv_id = (((line.get("variant") or {}).get("inventoryItem") or {}).get("id")
+            inv_id = get_nested(line, "variant", "inventoryItem", "id")
             if inv_id and inv_id not in seen:
                 ids.append(inv_id)
                 seen.add(inv_id)
+
     return ids
 
 
@@ -1050,7 +1104,7 @@ def main() -> None:
             processed += 1
         except Exception as exc:
             failed += 1
-            logger.exception("%s | FAILED | %s", draft.get("name", draft.get("id"), exc)
+            logger.exception("%s | FAILED | %s", draft.get("name", draft.get("id")), exc)
 
     logger.info("----- DONE -----")
     logger.info("Processed: %s", processed)
