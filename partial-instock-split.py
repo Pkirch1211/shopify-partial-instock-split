@@ -306,6 +306,7 @@ query GetDraftOrders($cursor: String, $query: String!) {
     nodes {
       id
       name
+      status
       tags
       poNumber
       note2
@@ -452,6 +453,16 @@ def fetch_open_drafts() -> List[Dict[str, Any]]:
             break
         cursor = bucket["pageInfo"]["endCursor"]
         sleep_brief()
+
+    # Client-side guard: drop anything Shopify returned that isn't actually open.
+    # Completed drafts (converted to orders) can slip through the status:open query filter.
+    before_status_filter = len(drafts)
+    drafts = [d for d in drafts if str(d.get('status', '')).upper() == 'OPEN']
+    if len(drafts) < before_status_filter:
+        logger.info(
+            'Dropped %s non-open draft(s) after client-side status filter',
+            before_status_filter - len(drafts),
+        )
 
     if DRAFT_ORDER_NAMES:
         target_lower = {name.lstrip("#").lower() for name in DRAFT_ORDER_NAMES}
