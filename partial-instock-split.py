@@ -840,8 +840,9 @@ def build_child_draft_input(
         "lineItems": [build_line_payload(line) for line in available_lines],
         "tags": tags,
         "poNumber": child_po,
+        # note2 is a read-only field on DraftOrder; it cannot be set via DraftOrderInput.
+        # Only "note" is writable. We copy the parent's note to the child.
         "note": parent.get("note") or None,
-        "note2": parent.get("note2") or None,
         "visibleToCustomer": bool(parent.get("visibleToCustomer")),
         "metafields": build_child_metafields(parent, child_po),
     }
