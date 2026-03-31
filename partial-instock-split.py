@@ -604,19 +604,36 @@ def should_skip_for_ship_date(draft: Dict[str, Any]) -> Tuple[bool, str]:
 # ----------------------------
 # PO hierarchy / lineage
 # ----------------------------
-def parse_po_root_and_suffix(po_number: str) -> Tuple[str, Optional[str]]:
+def parse_po_root_and_suffix(po_number: str) -> Tuple[str, Optional[str], str]:
     po = (po_number or "").strip()
     if not po:
-        return "", None
+        return "", None, ""
 
-    match = re.match(r"^(.*?)-(BO(?:\d+)?(?:\.\d+)*)$", po, flags=re.IGNORECASE)
+    # Match:
+    #   ROOT-BO
+    #   ROOT BO
+    #   ROOT-BO1
+    #   ROOT BO1.2
+    match = re.match(r"^(.*?)([-\s]+)(BO(?:\d+)?(?:\.\d+)*)$", po, flags=re.IGNORECASE)
     if match:
-        return match.group(1), match.group(2).upper()
-    return po, None
+        root = match.group(1).strip()
+        sep = match.group(2)
+        suffix = match.group(3).upper()
+        return root, suffix, sep
+
+    # Match standalone:
+    #   BO
+    #   BO1
+    #   BO1.2
+    match = re.match(r"^(BO(?:\d+)?(?:\.\d+)*)$", po, flags=re.IGNORECASE)
+    if match:
+        return "", match.group(1).upper(), ""
+
+    return po, None, ""
 
 
 def split_depth_from_po(po_number: str) -> int:
-    _, suffix = parse_po_root_and_suffix(po_number)
+    _, suffix, _ = parse_po_root_and_suffix(po_number)
     if not suffix:
         return 0
 
@@ -631,12 +648,14 @@ def split_depth_from_po(po_number: str) -> int:
 
 
 def split_root_po(po_number: str) -> str:
-    root, _ = parse_po_root_and_suffix(po_number)
+    root, suffix, _ = parse_po_root_and_suffix(po_number)
+    if suffix and not root:
+        return ""
     return root or (po_number or "").strip()
 
 
 def next_child_suffix(parent_po: str) -> str:
-    _, suffix = parse_po_root_and_suffix(parent_po)
+    _, suffix, _ = parse_po_root_and_suffix(parent_po)
     if not suffix:
         return "BO"
 
@@ -648,9 +667,14 @@ def next_child_suffix(parent_po: str) -> str:
 
 
 def build_child_po(parent_po: str) -> str:
-    root = split_root_po(parent_po)
-    suffix = next_child_suffix(parent_po)
-    return f"{root}-{suffix}" if root else suffix
+    root, suffix, sep = parse_po_root_and_suffix(parent_po)
+
+    if suffix:
+        next_suffix = next_child_suffix(parent_po)
+        return f"{root}{sep}{next_suffix}" if root else next_suffix
+
+    next_suffix = next_child_suffix(parent_po)
+    return f"{parent_po.strip()}-{next_suffix}" if parent_po.strip() else next_suffix
 
 
 def can_split_more(parent_po: str) -> Tuple[bool, str]:
@@ -658,8 +682,6 @@ def can_split_more(parent_po: str) -> Tuple[bool, str]:
     if depth >= MAX_SPLIT_DEPTH:
         return False, f"Split depth {depth} already at MAX_SPLIT_DEPTH {MAX_SPLIT_DEPTH}"
     return True, ""
-
-
 # ----------------------------
 # Draft transformation
 # ----------------------------
