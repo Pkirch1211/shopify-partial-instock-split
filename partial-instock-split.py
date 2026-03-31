@@ -20,7 +20,7 @@ load_dotenv()
 # ----------------------------
 SHOPIFY_SHOP = os.getenv("SHOPIFY_SHOP", "").strip()
 SHOPIFY_TOKEN = os.getenv("SHOPIFY_TOKEN", "").strip()
-SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2025-10").strip()
+SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2025-07").strip()
 SHOPIFY_LOCATION_ID = os.getenv("SHOPIFY_LOCATION_ID", "").strip()
 DRY_RUN = os.getenv("DRY_RUN", "true").strip().lower() == "true"
 
@@ -313,63 +313,8 @@ query GetDraftOrders($cursor: String, $query: String!) {
         key
         value
       }
-      purchasingEntity {
-        ... on PurchasingCompany {
-          company {
-            id
-          }
-          location {
-            id
-          }
-        }
-      }
-      customer {
-        id
-        email
-        firstName
-        lastName
-      }
-      shippingAddress {
-        firstName
-        lastName
-        company
-        address1
-        address2
-        city
-        province
-        zip
-        country
-        phone
-      }
-      billingAddress {
-        firstName
-        lastName
-        company
-        address1
-        address2
-        city
-        province
-        zip
-        country
-        phone
-      }
-      appliedDiscount {
-        title
-        value
-        valueType
-        description
-        amountV2 {
-          amount
-          currencyCode
-        }
-      }
-      reserveInventoryUntil
       visibleToCustomer
-      paymentTerms {
-        id
-        paymentTermsName
-        paymentTermsType
-      }
+      reserveInventoryUntil
       metafields(first: 100) {
         nodes {
           namespace
@@ -436,6 +381,23 @@ query InventoryLevels($inventoryItemIds: [ID!]!, $locationId: ID!) {
 }
 """
 
+DUPLICATE_DRAFT_MUTATION = """
+mutation DraftOrderDuplicate($id: ID!) {
+  draftOrderDuplicate(id: $id) {
+    draftOrder {
+      id
+      name
+      poNumber
+      tags
+    }
+    userErrors {
+      field
+      message
+    }
+  }
+}
+"""
+
 UPDATE_DRAFT_MUTATION = """
 mutation DraftOrderUpdate($id: ID!, $input: DraftOrderInput!) {
   draftOrderUpdate(id: $id, input: $input) {
@@ -453,15 +415,10 @@ mutation DraftOrderUpdate($id: ID!, $input: DraftOrderInput!) {
 }
 """
 
-CREATE_DRAFT_MUTATION = """
-mutation DraftOrderCreate($input: DraftOrderInput!) {
-  draftOrderCreate(input: $input) {
-    draftOrder {
-      id
-      name
-      poNumber
-      tags
-    }
+DELETE_DRAFT_MUTATION = """
+mutation DraftOrderDelete($id: ID!) {
+  draftOrderDelete(input: { id: $id }) {
+    deletedId
     userErrors {
       field
       message
@@ -563,22 +520,46 @@ def update_draft(draft_id: str, input_payload: Dict[str, Any]) -> Dict[str, Any]
     return payload["draftOrder"]
 
 
-def create_draft(input_payload: Dict[str, Any]) -> Dict[str, Any]:
+def duplicate_draft(parent_id: str) -> Dict[str, Any]:
+    """
+    Duplicate a draft order via draftOrderDuplicate.
+    This copies the draft wholesale — including purchasingEntity / B2B company
+    context, customer, addresses, payment terms, note — without needing to
+    manually specify any of those fields in DraftOrderInput.
+    """
     if DRY_RUN:
-        logger.info("DRY RUN | would create child draft with payload: %s", input_payload)
+        logger.info("DRY RUN | would duplicate draft %s", parent_id)
         return {
             "id": "gid://shopify/DraftOrder/DRY_RUN",
             "name": "#DRYRUN",
-            "poNumber": input_payload.get("poNumber", ""),
-            "tags": input_payload.get("tags", []),
+            "poNumber": "",
+            "tags": [],
         }
 
-    data = graphql(CREATE_DRAFT_MUTATION, {"input": input_payload})
-    payload = data["draftOrderCreate"]
+    data = graphql(DUPLICATE_DRAFT_MUTATION, {"id": parent_id})
+    payload = data["draftOrderDuplicate"]
     errors = payload.get("userErrors") or []
     if errors:
-        raise RuntimeError(f"draftOrderCreate failed: {errors}")
+        raise RuntimeError(f"draftOrderDuplicate failed: {errors}")
     return payload["draftOrder"]
+
+
+def delete_draft(draft_id: str) -> None:
+    """Delete a draft order — used for rollback if child update fails."""
+    if DRY_RUN:
+        logger.info("DRY RUN | would delete draft %s", draft_id)
+        return
+
+    try:
+        data = graphql(DELETE_DRAFT_MUTATION, {"id": draft_id})
+        payload = data["draftOrderDelete"]
+        errors = payload.get("userErrors") or []
+        if errors:
+            logger.warning("draftOrderDelete userErrors for %s: %s", draft_id, errors)
+        else:
+            logger.info("Deleted draft %s (rollback)", draft_id)
+    except Exception as exc:
+        logger.warning("Failed to delete draft %s during rollback: %s", draft_id, exc)
 
 
 # ----------------------------
@@ -741,43 +722,12 @@ def build_line_payload(line: Dict[str, Any]) -> Dict[str, Any]:
     return payload
 
 
-def build_address_payload(address: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    if not address:
-        return None
-
-    payload = {
-        key: address.get(key)
-        for key in [
-            "firstName",
-            "lastName",
-            "company",
-            "address1",
-            "address2",
-            "city",
-            "province",
-            "zip",
-            "country",
-            "phone",
-        ]
-        if address.get(key) not in (None, "")
-    }
-    return payload or None
-
-
-def build_custom_attributes_payload(parent: Dict[str, Any]) -> Optional[List[Dict[str, str]]]:
-    attrs = parent.get("customAttributes") or []
-    payload = [
-        {
-            "key": str(attr.get("key", "")).strip(),
-            "value": str(attr.get("value", "")).strip(),
-        }
-        for attr in attrs
-        if str(attr.get("key", "")).strip()
-    ]
-    return payload or None
-
-
 def build_child_metafields(parent: Dict[str, Any], child_po: str) -> List[Dict[str, str]]:
+    """
+    Build metafields for the child draft.
+    Copies all metafields from parent (except stale lineage fields),
+    then appends fresh lineage fields for this split.
+    """
     parent_po = (parent.get("poNumber") or "").strip()
     root_po = split_root_po(parent_po)
     split_depth = split_depth_from_po(child_po)
@@ -794,6 +744,7 @@ def build_child_metafields(parent: Dict[str, Any], child_po: str) -> List[Dict[s
         if not namespace or not key or not mf_type or value is None:
             continue
 
+        # Drop stale lineage fields — we'll write fresh ones below
         if namespace == LINEAGE_NAMESPACE and key.startswith("partial_split_"):
             continue
 
@@ -864,63 +815,48 @@ def build_child_metafields(parent: Dict[str, Any], child_po: str) -> List[Dict[s
     return existing
 
 
-def build_child_draft_input(
+def build_child_update_payload(
     parent: Dict[str, Any],
     available_lines: List[Dict[str, Any]],
     child_po: str,
 ) -> Dict[str, Any]:
+    """
+    Build the update payload applied to the duplicated child draft.
+
+    Because we use draftOrderDuplicate, the child already has the correct:
+      - customer / B2B purchasingEntity / company association
+      - shipping + billing addresses
+      - payment terms
+      - note
+
+    We only need to update: line items, tags, PO number, metafields,
+    and custom attributes.
+    """
     tags = normalize_tags(parent.get("tags", []))
     tags = remove_tags(tags, PROCESSING_TAG, PARTIAL_PARENT_TAG)
     tags = add_tags(tags, PARTIAL_CHILD_TAG)
 
-    input_payload: Dict[str, Any] = {
+    # Carry forward parent custom attributes
+    custom_attributes = [
+        {
+            "key": str(attr.get("key", "")).strip(),
+            "value": str(attr.get("value", "")).strip(),
+        }
+        for attr in (parent.get("customAttributes") or [])
+        if str(attr.get("key", "")).strip()
+    ] or None
+
+    payload: Dict[str, Any] = {
         "lineItems": [build_line_payload(line) for line in available_lines],
         "tags": tags,
         "poNumber": child_po,
-        # DraftOrder exposes the note as `note2` (read). DraftOrderInput accepts `note` (write).
-        "note": parent.get("note2") or None,
-        "visibleToCustomer": bool(parent.get("visibleToCustomer")),
         "metafields": build_child_metafields(parent, child_po),
     }
 
-    custom_attributes = build_custom_attributes_payload(parent)
     if custom_attributes:
-        input_payload["customAttributes"] = custom_attributes
+        payload["customAttributes"] = custom_attributes
 
-    customer_id = get_nested(parent, "customer", "id")
-    if customer_id:
-        input_payload["customerId"] = customer_id
-
-    shipping = build_address_payload(parent.get("shippingAddress"))
-    if shipping:
-        input_payload["shippingAddress"] = shipping
-
-    billing = build_address_payload(parent.get("billingAddress"))
-    if billing:
-        input_payload["billingAddress"] = billing
-
-    applied_discount_payload = build_discount_payload(parent.get("appliedDiscount"))
-    if applied_discount_payload:
-        input_payload["appliedDiscount"] = applied_discount_payload
-
-    # NOTE: purchasingEntity is intentionally omitted from DraftOrderInput.
-    # The Shopify API (2025-10) does not accept purchasingEntity on DraftOrderInput —
-    # neither companyLocationId nor companyId/locationId are valid fields on
-    # PurchasingEntityInput in this context. The child draft is linked to the
-    # customer directly via customerId, which is sufficient.
-
-    payment_terms_id = get_nested(
-        parent,
-        "paymentTerms",
-        "id",
-    )
-    if payment_terms_id:
-        input_payload["paymentTerms"] = {"paymentTermsTemplateId": payment_terms_id}
-
-    if parent.get("reserveInventoryUntil"):
-        input_payload["reserveInventoryUntil"] = parent["reserveInventoryUntil"]
-
-    return {k: v for k, v in input_payload.items() if v is not None}
+    return payload
 
 
 def build_parent_update_payload(
@@ -1067,17 +1003,35 @@ def process_draft(draft: Dict[str, Any], availability_by_item: Dict[str, int]) -
     child_po = build_child_po(draft.get("poNumber") or "")
     logger.info("%s | thresholds passed | child_po=%s", name, child_po)
 
-    child_input = build_child_draft_input(draft, eval_data["available_lines"], child_po)
-    parent_input = build_parent_update_payload(draft, eval_data["remaining_lines"])
+    # Step 1: Duplicate the parent.
+    # draftOrderDuplicate copies everything — B2B purchasingEntity/company,
+    # customer, addresses, payment terms, note — no need to pass any of those
+    # fields manually in DraftOrderInput.
+    child = duplicate_draft(draft["id"])
+    logger.info("%s | duplicated -> %s", name, child.get("name") or child.get("id"))
 
-    child = create_draft(child_input)
+    # Step 2: Update the duplicate with child-specific fields only.
+    # If the update fails, roll back by deleting the duplicate.
+    child_update = build_child_update_payload(draft, eval_data["available_lines"], child_po)
+    try:
+        child = update_draft(child["id"], child_update)
+    except Exception as exc:
+        logger.error(
+            "%s | child update failed — rolling back duplicate %s: %s",
+            name, child.get("id"), exc,
+        )
+        delete_draft(child["id"])
+        raise
+
     logger.info(
-        "%s | child created -> %s (%s)",
+        "%s | child updated -> %s (%s)",
         name,
         child.get("name") or child.get("id"),
         child.get("poNumber") or child_po,
     )
 
+    # Step 3: Update the parent with remaining lines + done tag.
+    parent_input = build_parent_update_payload(draft, eval_data["remaining_lines"])
     update_draft(draft["id"], parent_input)
     logger.info("%s | parent updated with remaining lines", name)
 
