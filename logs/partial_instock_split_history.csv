@@ -1,0 +1,2 @@
+timestamp_utc,parent_draft_id,parent_draft_name,parent_po,child_draft_id,child_draft_name,child_po,ship_date,available_line_count,remaining_line_count,available_value,total_value,available_percent,split_depth_parent,split_depth_child,reason,dry_run
+2026-03-31T05:38:51+00:00,gid://shopify/DraftOrder/1502986010990,#D15483,KW6855142 BO,gid://shopify/DraftOrder/DRY_RUN,#DRYRUN,KW6855142 BO-BO,,5,8,780.0,1314.0,59.36,0,1,partial_instock_split,true
