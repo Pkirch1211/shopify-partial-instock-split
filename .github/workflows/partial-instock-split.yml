@@ -1,9 +1,3 @@
-
----
-
-### `.github/workflows/partial-instock-split.yml`
-
-```yaml id="yml1"
 name: Partial In-Stock Split
 
 on:
