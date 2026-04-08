@@ -3,8 +3,7 @@ name: Partial In-Stock Split
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 12-21/3 * * 1-5"
-
+  - cron: "15 12-21/3 * * 1-5"
 permissions:
   contents: write
 
