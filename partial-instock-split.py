@@ -904,9 +904,13 @@ def has_excluded_sku(draft: Dict[str, Any]) -> bool:
             or ""
         ).strip().upper()
         if sku and sku in EXCLUDE_SKUS:
+            logger.info(
+                "%s | contains excluded SKU: %s",
+                draft.get("name", "(unknown)"),
+                sku,
+            )
             return True
     return False
-
 
 # ----------------------------
 # Evaluation
