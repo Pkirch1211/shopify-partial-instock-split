@@ -42,6 +42,10 @@ jobs:
           SUBMITTED_TAG: ${{ vars.SUBMITTED_TAG }}
           LINEAGE_NAMESPACE: ${{ vars.LINEAGE_NAMESPACE }}
           DRAFT_ORDER_NAMES: ${{ vars.DRAFT_ORDER_NAMES }}
+          LINEAGE_NAMESPACE: ${{ vars.LINEAGE_NAMESPACE }}
+          EXCLUDE_SKUS: ${{ vars.EXCLUDE_SKUS }}
+          MIN_REMAINING_LINES: ${{ vars.MIN_REMAINING_LINES }}
+          DRAFT_ORDER_NAMES: ${{ vars.DRAFT_ORDER_NAMES }}
           CSV_LOG_PATH: logs/partial_instock_split_history.csv
         run: python partial-instock-split.py
 
