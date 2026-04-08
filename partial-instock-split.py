@@ -27,7 +27,14 @@ DRY_RUN = os.getenv("DRY_RUN", "true").strip().lower() == "true"
 MIN_AVAILABLE_LINES = int(os.getenv("MIN_AVAILABLE_LINES", "2").strip())
 MIN_AVAILABLE_VALUE = Decimal(os.getenv("MIN_AVAILABLE_VALUE", "100").strip())
 MIN_AVAILABLE_PERCENT = Decimal(os.getenv("MIN_AVAILABLE_PERCENT", "0.30").strip())
+MIN_REMAINING_LINES = int(os.getenv("MIN_REMAINING_LINES", "2").strip())
 MAX_SPLIT_DEPTH = int(os.getenv("MAX_SPLIT_DEPTH", "2").strip())
+
+EXCLUDE_SKUS: Set[str] = {
+    s.strip().upper()
+    for s in os.getenv("EXCLUDE_SKUS", "").split(",")
+    if s.strip()
+}
 
 PARTIAL_PARENT_TAG = os.getenv("PARTIAL_PARENT_TAG", "partial-instock-split-done").strip()
 PARTIAL_CHILD_TAG = os.getenv("PARTIAL_CHILD_TAG", "partial-instock-child").strip()
@@ -457,10 +464,10 @@ def fetch_open_drafts() -> List[Dict[str, Any]]:
     # Client-side guard: drop anything Shopify returned that isn't actually open.
     # Completed drafts (converted to orders) can slip through the status:open query filter.
     before_status_filter = len(drafts)
-    drafts = [d for d in drafts if str(d.get('status', '')).upper() == 'OPEN']
+    drafts = [d for d in drafts if str(d.get("status", "")).upper() == "OPEN"]
     if len(drafts) < before_status_filter:
         logger.info(
-            'Dropped %s non-open draft(s) after client-side status filter',
+            "Dropped %s non-open draft(s) after client-side status filter",
             before_status_filter - len(drafts),
         )
 
@@ -885,6 +892,23 @@ def build_parent_update_payload(
 
 
 # ----------------------------
+# SKU exclusion check
+# ----------------------------
+def has_excluded_sku(draft: Dict[str, Any]) -> bool:
+    if not EXCLUDE_SKUS:
+        return False
+    for line in ((draft.get("lineItems") or {}).get("nodes") or []):
+        sku = (
+            line.get("sku")
+            or get_nested(line, "variant", "sku")
+            or ""
+        ).strip().upper()
+        if sku and sku in EXCLUDE_SKUS:
+            return True
+    return False
+
+
+# ----------------------------
 # Evaluation
 # ----------------------------
 def evaluate_draft(draft: Dict[str, Any], availability_by_item: Dict[str, int]) -> Dict[str, Any]:
@@ -955,6 +979,11 @@ def should_split(draft: Dict[str, Any], eval_data: Dict[str, Any]) -> Tuple[bool
             f"Available percent {eval_data['available_percent']:.2%} < MIN_AVAILABLE_PERCENT {MIN_AVAILABLE_PERCENT:.0%}"
         )
 
+    if eval_data["remaining_count"] < MIN_REMAINING_LINES:
+        reasons.append(
+            f"Remaining line count {eval_data['remaining_count']} < MIN_REMAINING_LINES {MIN_REMAINING_LINES}"
+        )
+
     if eval_data["remaining_count"] < 1:
         reasons.append("No remaining lines would stay on parent")
 
@@ -979,6 +1008,10 @@ def process_draft(draft: Dict[str, Any], availability_by_item: Dict[str, int]) -
 
     if any(t.lower() == PROCESSING_TAG.lower() for t in tags):
         logger.info("%s | skipped | already processing", name)
+        return
+
+    if has_excluded_sku(draft):
+        logger.info("%s | skipped | contains excluded SKU", name)
         return
 
     logger.info("\nProcessing %s (DRY_RUN=%s)", name, DRY_RUN)
@@ -1080,7 +1113,9 @@ def main() -> None:
     logger.info("MIN_AVAILABLE_LINES=%s", MIN_AVAILABLE_LINES)
     logger.info("MIN_AVAILABLE_VALUE=%s", MIN_AVAILABLE_VALUE)
     logger.info("MIN_AVAILABLE_PERCENT=%s", MIN_AVAILABLE_PERCENT)
+    logger.info("MIN_REMAINING_LINES=%s", MIN_REMAINING_LINES)
     logger.info("MAX_SPLIT_DEPTH=%s", MAX_SPLIT_DEPTH)
+    logger.info("EXCLUDE_SKUS=%s", sorted(EXCLUDE_SKUS) if EXCLUDE_SKUS else "(none)")
     logger.info("LINEAGE_NAMESPACE=%s", LINEAGE_NAMESPACE)
     logger.info("CSV_LOG_PATH=%s", CSV_LOG_PATH)
 
