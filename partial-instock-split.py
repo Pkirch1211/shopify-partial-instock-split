@@ -372,10 +372,6 @@ query GetDraftOrders($cursor: String, $query: String!) {
 }
 """
 
-# ----------------------------------------------------------------
-# FIX: Fresh single-draft fetch used to verify live state before
-# any write. Prevents acting on a stale in-memory snapshot.
-# ----------------------------------------------------------------
 SINGLE_DRAFT_QUERY = """
 query GetSingleDraftOrder($id: ID!) {
   draftOrder(id: $id) {
@@ -439,11 +435,6 @@ query GetSingleDraftOrder($id: ID!) {
 }
 """
 
-# ----------------------------------------------------------------
-# FIX: Search for any existing child draft that references this
-# parent's PO number in its lineage metafield. Used to detect
-# orphaned children from a failed prior run.
-# ----------------------------------------------------------------
 CHILD_SEARCH_QUERY = """
 query FindChildDrafts($query: String!) {
   draftOrders(first: 10, query: $query) {
@@ -583,11 +574,6 @@ def fetch_open_drafts() -> List[Dict[str, Any]]:
     return drafts
 
 
-# ----------------------------------------------------------------
-# FIX: Fetch a single draft fresh from the API.
-# Always called immediately before any write to avoid acting on
-# a stale cached snapshot (the root cause of double-splits).
-# ----------------------------------------------------------------
 def fetch_draft_fresh(draft_id: str) -> Optional[Dict[str, Any]]:
     """
     Fetch a single draft order directly from the API, bypassing
@@ -608,40 +594,45 @@ def fetch_draft_fresh(draft_id: str) -> Optional[Dict[str, Any]]:
 
 
 # ----------------------------------------------------------------
-# FIX: Check whether a child draft already exists for this parent.
-# Searches for any open draft tagged partial-instock-child that
-# carries a partial_split_parent_draft_id lineage metafield
-# matching the parent's Shopify GID.
+# FIX #2 (HARDENED): find_existing_child_for_parent now raises on
+# search failure rather than silently returning None.
 #
-# This catches the "orphaned child" scenario where:
-#   - Run A duplicated successfully but child update OR parent
-#     update failed / timed out
-#   - Run A's rollback delete also failed (or was skipped)
-#   - Run B now sees the parent still eligible and would
-#     duplicate again, creating a second child
+# Previously a failed orphan search returned None, meaning the
+# script would proceed as if no child existed — the exact scenario
+# we're trying to prevent. Now any search failure is a hard stop.
+# The caller tags the parent with NEEDS_REVIEW_TAG so the operator
+# knows why it was halted.
 # ----------------------------------------------------------------
 def find_existing_child_for_parent(parent_id: str, parent_po: str) -> Optional[Dict[str, Any]]:
     """
     Return an existing child draft for this parent, or None.
     Searches both by tag and by lineage metafield to be safe.
+
+    RAISES RuntimeError if the search itself fails — callers must
+    treat a failed search as a hard stop, not a clean pass.
     """
     if DRY_RUN:
         # In dry-run we can't create anything, so no orphan risk.
         return None
 
-    # Build a narrow query: tag + PO fragment to avoid full table scans
     safe_po_fragment = re.sub(r"[^\w\-.]", "", parent_po or "")[:30]
     query_parts = [f"tag:{PARTIAL_CHILD_TAG}", "status:open"]
     if safe_po_fragment:
         query_parts.append(f"po_number:*{safe_po_fragment}*")
     search_query = " ".join(query_parts)
 
+    # FIX #2: Raise on failure — do NOT silently return None.
+    # A failed search means we cannot confirm the absence of a child,
+    # so proceeding would risk creating a duplicate.
     try:
         data = graphql(CHILD_SEARCH_QUERY, {"query": search_query})
         candidates = (data.get("draftOrders") or {}).get("nodes") or []
     except Exception as exc:
-        logger.warning("find_existing_child | search failed: %s", exc)
-        return None
+        raise RuntimeError(
+            f"find_existing_child | orphan search failed for parent {parent_id} — "
+            f"cannot safely proceed without confirming no child exists. "
+            f"Halting this draft. Error: {exc}"
+        ) from exc
 
     for candidate in candidates:
         for mf in ((candidate.get("metafields") or {}).get("nodes") or []):
@@ -747,13 +738,6 @@ def delete_draft(draft_id: str) -> None:
         else:
             logger.info("Deleted draft %s (rollback)", draft_id)
     except Exception as exc:
-        # ----------------------------------------------------------------
-        # FIX: Surface rollback failures loudly. A swallowed exception
-        # here is exactly what leaves orphaned children in place for the
-        # next run to find as "eligible parents". We still don't re-raise
-        # (rollback is best-effort) but we emit a prominent warning so
-        # the operator can manually clean up before the next run.
-        # ----------------------------------------------------------------
         logger.error(
             "ROLLBACK FAILED — draft %s was NOT deleted and may be orphaned. "
             "Please manually review/delete this draft before the next run. Error: %s",
@@ -1153,19 +1137,6 @@ def should_split(draft: Dict[str, Any], eval_data: Dict[str, Any]) -> Tuple[bool
     return (len(reasons) == 0), reasons
 
 
-# ----------------------------------------------------------------
-# FIX: claim_draft now does a fresh API read + atomic tag write.
-#
-# Original bug: claim_draft() checked tags from the in-memory
-# snapshot fetched at startup. Two concurrent/overlapping runs
-# could both pass the check (the snapshot had no PROCESSING_TAG
-# yet) and both proceed to duplicate.
-#
-# Fix: we re-fetch the live draft immediately before writing the
-# claim tag, then verify the written result. This narrows the
-# race window to the ~milliseconds of the API round-trip rather
-# than the minutes between fetch and process.
-# ----------------------------------------------------------------
 def claim_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
     """
     Atomically mark a draft as in-progress.
@@ -1173,7 +1144,9 @@ def claim_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
     1. Re-fetch live state from the API (bypasses stale snapshot).
     2. Verify no disqualifying tags have appeared since fetch.
     3. Write PROCESSING_TAG and verify it landed.
-    4. Return the freshly-fetched draft (used by caller for all
+    4. Check that no disqualifying tags appeared *during* the write
+       window (FIX #1: closes the sub-millisecond race).
+    5. Return the freshly-fetched draft (used by caller for all
        subsequent logic so we never act on a stale snapshot).
 
     Raises RuntimeError if the draft should not be processed.
@@ -1202,7 +1175,7 @@ def claim_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
             )
 
     # -- 3. Write claim tag --------------------------------------------
-    updated = update_draft(
+    update_draft(
         draft_id,
         {"tags": add_tags(live.get("tags", []), PROCESSING_TAG)},
     )
@@ -1211,7 +1184,8 @@ def claim_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
     if DRY_RUN:
         return live
 
-    # -- 4. Verify the tag actually landed (guards against silent failures) --
+    # -- 4. Verify the tag landed AND check for tags that appeared
+    #       during the write window (FIX #1: race condition hardening).
     verify = fetch_draft_fresh(draft_id)
     if verify is None:
         raise RuntimeError(
@@ -1219,22 +1193,45 @@ def claim_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
         )
 
     verify_tags_lower = {t.lower() for t in normalize_tags(verify.get("tags", []))}
+
     if PROCESSING_TAG.lower() not in verify_tags_lower:
         raise RuntimeError(
             f"{name} | claim verification failed | PROCESSING_TAG not present after write"
         )
 
-    logger.info("%s | claimed successfully (live tag verified)", name)
+    # FIX #1: A concurrent process may have also written a tag during
+    # our write window. Check for disqualifying tags in the post-write
+    # state and back off cleanly if any are present.
+    for excluded_tag in EXCLUDE_TAGS:
+        if excluded_tag.lower() in verify_tags_lower:
+            logger.warning(
+                "%s | claim race detected | '%s' appeared during write window — backing off",
+                name,
+                excluded_tag,
+            )
+            try:
+                update_draft(
+                    draft_id,
+                    {"tags": remove_tags(verify.get("tags", []), PROCESSING_TAG)},
+                )
+            except Exception as untag_exc:
+                logger.error(
+                    "%s | failed to remove PROCESSING_TAG after race back-off: %s",
+                    name,
+                    untag_exc,
+                )
+            raise RuntimeError(
+                f"{name} | claim aborted | disqualifying tag '{excluded_tag}' "
+                "appeared during claim write window"
+            )
+
+    logger.info("%s | claimed successfully (live tag verified, no race detected)", name)
     return live  # return the pre-claim live draft for use in processing
 
 
 def process_draft(draft: Dict[str, Any], availability_by_item: Dict[str, int]) -> None:
     name = draft.get("name", draft.get("id", "<unknown>"))
 
-    # ----------------------------------------------------------------
-    # FIX: Use in-memory tags only for a cheap early-exit. The real
-    # authority check happens inside claim_draft() via a fresh read.
-    # ----------------------------------------------------------------
     tags_snapshot = normalize_tags(draft.get("tags", []))
     if any(t.lower() == PROCESSING_TAG.lower() for t in tags_snapshot):
         logger.info("%s | skipped | already processing (snapshot check)", name)
@@ -1246,14 +1243,29 @@ def process_draft(draft: Dict[str, Any], availability_by_item: Dict[str, int]) -
 
     logger.info("\nProcessing %s (DRY_RUN=%s)", name, DRY_RUN)
 
-    # ----------------------------------------------------------------
-    # FIX: Check for orphaned children from a previous failed run
-    # BEFORE claiming or duplicating. If a child already exists for
-    # this parent (by lineage metafield) we halt and flag for review
-    # rather than creating a second child.
-    # ----------------------------------------------------------------
     parent_po = (draft.get("poNumber") or "").strip()
-    existing_child = find_existing_child_for_parent(draft["id"], parent_po)
+
+    # ----------------------------------------------------------------
+    # FIX #2 + #3: Orphan check now raises on search failure (handled
+    # below) rather than silently returning None and proceeding.
+    # ----------------------------------------------------------------
+    try:
+        existing_child = find_existing_child_for_parent(draft["id"], parent_po)
+    except RuntimeError as search_exc:
+        logger.error(
+            "%s | HALTED | orphan search failed — cannot safely proceed. "
+            "Tagging parent with '%s'. Error: %s",
+            name,
+            NEEDS_REVIEW_TAG,
+            search_exc,
+        )
+        try:
+            live_tags = normalize_tags(draft.get("tags", []))
+            update_draft(draft["id"], {"tags": add_tags(live_tags, NEEDS_REVIEW_TAG)})
+        except Exception as tag_exc:
+            logger.warning("%s | failed to apply needs-review tag: %s", name, tag_exc)
+        return
+
     if existing_child is not None:
         logger.error(
             "%s | HALTED | orphaned child draft %s already exists for this parent. "
@@ -1264,7 +1276,6 @@ def process_draft(draft: Dict[str, Any], availability_by_item: Dict[str, int]) -
             existing_child.get("name") or existing_child.get("id"),
             NEEDS_REVIEW_TAG,
         )
-        # Tag parent for manual review; do not re-raise (allow other drafts to continue).
         try:
             live_tags = normalize_tags(draft.get("tags", []))
             update_draft(draft["id"], {"tags": add_tags(live_tags, NEEDS_REVIEW_TAG)})
@@ -1272,21 +1283,12 @@ def process_draft(draft: Dict[str, Any], availability_by_item: Dict[str, int]) -
             logger.warning("%s | failed to apply needs-review tag: %s", name, tag_exc)
         return
 
-    # ----------------------------------------------------------------
-    # FIX: ship-date check uses in-memory metafields (fine — they
-    # don't change between runs; only tags need live re-reads).
-    # ----------------------------------------------------------------
     ship_date_raw = get_metafield_value(draft, "b2b", "ship_date") or ""
     skip_for_ship_date, ship_date_reason = should_skip_for_ship_date(draft)
     if skip_for_ship_date:
         logger.info("%s | skipped | %s", name, ship_date_reason)
         return
 
-    # ----------------------------------------------------------------
-    # FIX: claim_draft now re-fetches live state, checks for races,
-    # writes the tag, and verifies it landed. It returns the fresh
-    # draft object; we use that for all downstream logic.
-    # ----------------------------------------------------------------
     try:
         live_draft = claim_draft(draft)
     except RuntimeError as claim_exc:
@@ -1311,7 +1313,6 @@ def process_draft(draft: Dict[str, Any], availability_by_item: Dict[str, int]) -
 
     if not should_run:
         logger.info("%s | no split | reasons=%s", name, reasons)
-        # Remove processing tag cleanly; use live_draft tags as base
         update_draft(live_draft["id"], {"tags": remove_tags(live_draft.get("tags", []), PROCESSING_TAG)})
         return
 
@@ -1322,8 +1323,49 @@ def process_draft(draft: Dict[str, Any], availability_by_item: Dict[str, int]) -
     child = duplicate_draft(live_draft["id"])
     logger.info("%s | duplicated -> %s", name, child.get("name") or child.get("id"))
 
-    # Step 2: Update the duplicate with child-specific fields only.
-    # On failure, attempt rollback (delete the orphaned duplicate).
+    # ----------------------------------------------------------------
+    # FIX #3: Immediately write PARTIAL_CHILD_TAG as a stub to the
+    # newly-created duplicate BEFORE the full child update.
+    #
+    # A freshly-duplicated draft inherits the parent's tags and has
+    # no lineage metafields yet, making it invisible to the orphan
+    # search in find_existing_child_for_parent(). If the process dies
+    # between duplicate_draft() and update_draft(child), the next run
+    # would see no child and attempt to duplicate again.
+    #
+    # Writing the tag here ensures the child is discoverable as soon
+    # as it exists, even if the full update never completes.
+    # ----------------------------------------------------------------
+    try:
+        update_draft(
+            child["id"],
+            {"tags": add_tags(child.get("tags", []), PARTIAL_CHILD_TAG)},
+        )
+        logger.info("%s | wrote stub PARTIAL_CHILD_TAG to child %s", name, child.get("id"))
+    except Exception as stub_exc:
+        logger.error(
+            "%s | failed to write stub tag to child %s — rolling back: %s",
+            name,
+            child.get("id"),
+            stub_exc,
+        )
+        delete_draft(child["id"])
+        try:
+            update_draft(
+                live_draft["id"],
+                {"tags": remove_tags(live_draft.get("tags", []), PROCESSING_TAG)},
+            )
+            logger.info("%s | removed PROCESSING_TAG after failed stub tag write", name)
+        except Exception as untag_exc:
+            logger.error(
+                "%s | CRITICAL: could not remove PROCESSING_TAG after stub rollback. "
+                "Draft will be stuck as processing until manually untagged. Error: %s",
+                name,
+                untag_exc,
+            )
+        raise
+
+    # Step 2: Full child update with line items, PO, metafields, etc.
     child_update = build_child_update_payload(live_draft, eval_data["available_lines"], child_po)
     try:
         child = update_draft(child["id"], child_update)
@@ -1333,13 +1375,6 @@ def process_draft(draft: Dict[str, Any], availability_by_item: Dict[str, int]) -
             name, child.get("id"), exc,
         )
         delete_draft(child["id"])
-        # ----------------------------------------------------------------
-        # FIX: After rollback (successful or not), remove the PROCESSING
-        # tag from the parent so the next run can retry cleanly.
-        # In the original code the parent was left with PROCESSING_TAG
-        # indefinitely after a rollback, causing it to be silently
-        # skipped on every subsequent run.
-        # ----------------------------------------------------------------
         try:
             update_draft(
                 live_draft["id"],
@@ -1362,7 +1397,6 @@ def process_draft(draft: Dict[str, Any], availability_by_item: Dict[str, int]) -
     )
 
     # Step 3: Update the parent with remaining lines + done tag.
-    # Use live_draft tags as the authoritative base.
     parent_input = build_parent_update_payload(live_draft, eval_data["remaining_lines"])
     update_draft(live_draft["id"], parent_input)
     logger.info("%s | parent updated with remaining lines", name)
