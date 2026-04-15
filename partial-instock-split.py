@@ -36,6 +36,12 @@ EXCLUDE_SKUS: Set[str] = {
     if s.strip()
 }
 
+EXCLUDE_CUSTOMERS: Set[str] = {
+    s.strip().lower()
+    for s in os.getenv("EXCLUDE_CUSTOMER", "").split(",")
+    if s.strip()
+}
+
 PARTIAL_PARENT_TAG = os.getenv("PARTIAL_PARENT_TAG", "partial-instock-split-done").strip()
 PARTIAL_CHILD_TAG = os.getenv("PARTIAL_CHILD_TAG", "partial-instock-child").strip()
 PROCESSING_TAG = os.getenv("PROCESSING_TAG", "partial-instock-processing").strip()
@@ -323,6 +329,13 @@ query GetDraftOrders($cursor: String, $query: String!) {
       }
       visibleToCustomer
       reserveInventoryUntil
+      customer {
+        id
+        firstName
+        lastName
+        email
+        displayName
+      }
       metafields(first: 100) {
         nodes {
           namespace
@@ -387,6 +400,13 @@ query GetSingleDraftOrder($id: ID!) {
     }
     visibleToCustomer
     reserveInventoryUntil
+    customer {
+      id
+      firstName
+      lastName
+      email
+      displayName
+    }
     metafields(first: 100) {
       nodes {
         namespace
@@ -546,7 +566,6 @@ def fetch_open_drafts() -> List[Dict[str, Any]]:
         cursor = bucket["pageInfo"]["endCursor"]
         sleep_brief()
 
-    # Client-side guard: drop anything Shopify returned that isn't actually open.
     before_status_filter = len(drafts)
     drafts = [d for d in drafts if str(d.get("status", "")).upper() == "OPEN"]
     if len(drafts) < before_status_filter:
@@ -575,10 +594,6 @@ def fetch_open_drafts() -> List[Dict[str, Any]]:
 
 
 def fetch_draft_fresh(draft_id: str) -> Optional[Dict[str, Any]]:
-    """
-    Fetch a single draft order directly from the API, bypassing
-    any in-memory state. Returns None if not found or not open.
-    """
     data = graphql(SINGLE_DRAFT_QUERY, {"id": draft_id})
     draft = data.get("draftOrder")
     if not draft:
@@ -593,16 +608,6 @@ def fetch_draft_fresh(draft_id: str) -> Optional[Dict[str, Any]]:
     return draft
 
 
-# ----------------------------------------------------------------
-# FIX #2 (HARDENED): find_existing_child_for_parent now raises on
-# search failure rather than silently returning None.
-#
-# Previously a failed orphan search returned None, meaning the
-# script would proceed as if no child existed — the exact scenario
-# we're trying to prevent. Now any search failure is a hard stop.
-# The caller tags the parent with NEEDS_REVIEW_TAG so the operator
-# knows why it was halted.
-# ----------------------------------------------------------------
 def find_existing_child_for_parent(parent_id: str, parent_po: str) -> Optional[Dict[str, Any]]:
     """
     Return an existing child draft for this parent, or None.
@@ -612,7 +617,6 @@ def find_existing_child_for_parent(parent_id: str, parent_po: str) -> Optional[D
     treat a failed search as a hard stop, not a clean pass.
     """
     if DRY_RUN:
-        # In dry-run we can't create anything, so no orphan risk.
         return None
 
     safe_po_fragment = re.sub(r"[^\w\-.]", "", parent_po or "")[:30]
@@ -621,9 +625,6 @@ def find_existing_child_for_parent(parent_id: str, parent_po: str) -> Optional[D
         query_parts.append(f"po_number:*{safe_po_fragment}*")
     search_query = " ".join(query_parts)
 
-    # FIX #2: Raise on failure — do NOT silently return None.
-    # A failed search means we cannot confirm the absence of a child,
-    # so proceeding would risk creating a duplicate.
     try:
         data = graphql(CHILD_SEARCH_QUERY, {"query": search_query})
         candidates = (data.get("draftOrders") or {}).get("nodes") or []
@@ -724,7 +725,6 @@ def duplicate_draft(parent_id: str) -> Dict[str, Any]:
 
 
 def delete_draft(draft_id: str) -> None:
-    """Delete a draft order — used for rollback if child update fails."""
     if DRY_RUN:
         logger.info("DRY RUN | would delete draft %s", draft_id)
         return
@@ -793,7 +793,7 @@ def split_depth_from_po(po_number: str) -> int:
     if not suffix:
         return 0
 
-    body = suffix[2:]  # remove BO
+    body = suffix[2:]
     if not body:
         return 1
 
@@ -1030,7 +1030,7 @@ def build_parent_update_payload(
 
 
 # ----------------------------
-# SKU exclusion check
+# SKU / customer exclusion check
 # ----------------------------
 def has_excluded_sku(draft: Dict[str, Any]) -> bool:
     if not EXCLUDE_SKUS:
@@ -1048,6 +1048,32 @@ def has_excluded_sku(draft: Dict[str, Any]) -> bool:
                 sku,
             )
             return True
+    return False
+
+
+def has_excluded_customer(draft: Dict[str, Any]) -> bool:
+    if not EXCLUDE_CUSTOMERS:
+        return False
+
+    customer = draft.get("customer") or {}
+
+    first_name = str(customer.get("firstName") or "").strip()
+    last_name = str(customer.get("lastName") or "").strip()
+    full_name = f"{first_name} {last_name}".strip().lower()
+    display_name = str(customer.get("displayName") or "").strip().lower()
+    email = str(customer.get("email") or "").strip().lower()
+
+    candidates = {x for x in [full_name, display_name, email] if x}
+
+    matched = candidates.intersection(EXCLUDE_CUSTOMERS)
+    if matched:
+        logger.info(
+            "%s | contains excluded customer: %s",
+            draft.get("name", "(unknown)"),
+            ", ".join(sorted(matched)),
+        )
+        return True
+
     return False
 
 
@@ -1144,24 +1170,19 @@ def claim_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
     1. Re-fetch live state from the API (bypasses stale snapshot).
     2. Verify no disqualifying tags have appeared since fetch.
     3. Write PROCESSING_TAG and verify it landed.
-    4. Check that no disqualifying tags appeared *during* the write
-       window (FIX #1: closes the sub-millisecond race).
-    5. Return the freshly-fetched draft (used by caller for all
-       subsequent logic so we never act on a stale snapshot).
-
-    Raises RuntimeError if the draft should not be processed.
+    4. Check that no disqualifying tags appeared during the write
+       window.
+    5. Return the freshly-fetched draft.
     """
     draft_id = draft["id"]
     name = draft.get("name", draft_id)
 
-    # -- 1. Fresh read -------------------------------------------------
     live = fetch_draft_fresh(draft_id)
     if live is None:
         raise RuntimeError(f"{name} | claim failed | draft not found or no longer OPEN")
 
     live_tags_lower = {t.lower() for t in normalize_tags(live.get("tags", []))}
 
-    # -- 2. Guard against concurrent claim or disqualifying tags -------
     if PROCESSING_TAG.lower() in live_tags_lower:
         raise RuntimeError(
             f"{name} | claim failed | PROCESSING_TAG already present (concurrent run?)"
@@ -1174,18 +1195,14 @@ def claim_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
                 "appeared since initial fetch"
             )
 
-    # -- 3. Write claim tag --------------------------------------------
     update_draft(
         draft_id,
         {"tags": add_tags(live.get("tags", []), PROCESSING_TAG)},
     )
 
-    # In dry-run update_draft returns a stub; skip verification.
     if DRY_RUN:
         return live
 
-    # -- 4. Verify the tag landed AND check for tags that appeared
-    #       during the write window (FIX #1: race condition hardening).
     verify = fetch_draft_fresh(draft_id)
     if verify is None:
         raise RuntimeError(
@@ -1199,9 +1216,6 @@ def claim_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
             f"{name} | claim verification failed | PROCESSING_TAG not present after write"
         )
 
-    # FIX #1: A concurrent process may have also written a tag during
-    # our write window. Check for disqualifying tags in the post-write
-    # state and back off cleanly if any are present.
     for excluded_tag in EXCLUDE_TAGS:
         if excluded_tag.lower() in verify_tags_lower:
             logger.warning(
@@ -1226,7 +1240,7 @@ def claim_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
             )
 
     logger.info("%s | claimed successfully (live tag verified, no race detected)", name)
-    return live  # return the pre-claim live draft for use in processing
+    return live
 
 
 def process_draft(draft: Dict[str, Any], availability_by_item: Dict[str, int]) -> None:
@@ -1241,14 +1255,14 @@ def process_draft(draft: Dict[str, Any], availability_by_item: Dict[str, int]) -
         logger.info("%s | skipped | contains excluded SKU", name)
         return
 
+    if has_excluded_customer(draft):
+        logger.info("%s | skipped | contains excluded customer", name)
+        return
+
     logger.info("\nProcessing %s (DRY_RUN=%s)", name, DRY_RUN)
 
     parent_po = (draft.get("poNumber") or "").strip()
 
-    # ----------------------------------------------------------------
-    # FIX #2 + #3: Orphan check now raises on search failure (handled
-    # below) rather than silently returning None and proceeding.
-    # ----------------------------------------------------------------
     try:
         existing_child = find_existing_child_for_parent(draft["id"], parent_po)
     except RuntimeError as search_exc:
@@ -1319,23 +1333,9 @@ def process_draft(draft: Dict[str, Any], availability_by_item: Dict[str, int]) -
     child_po = build_child_po(live_draft.get("poNumber") or "")
     logger.info("%s | thresholds passed | child_po=%s", name, child_po)
 
-    # Step 1: Duplicate the parent.
     child = duplicate_draft(live_draft["id"])
     logger.info("%s | duplicated -> %s", name, child.get("name") or child.get("id"))
 
-    # ----------------------------------------------------------------
-    # FIX #3: Immediately write PARTIAL_CHILD_TAG as a stub to the
-    # newly-created duplicate BEFORE the full child update.
-    #
-    # A freshly-duplicated draft inherits the parent's tags and has
-    # no lineage metafields yet, making it invisible to the orphan
-    # search in find_existing_child_for_parent(). If the process dies
-    # between duplicate_draft() and update_draft(child), the next run
-    # would see no child and attempt to duplicate again.
-    #
-    # Writing the tag here ensures the child is discoverable as soon
-    # as it exists, even if the full update never completes.
-    # ----------------------------------------------------------------
     try:
         update_draft(
             child["id"],
@@ -1365,7 +1365,6 @@ def process_draft(draft: Dict[str, Any], availability_by_item: Dict[str, int]) -
             )
         raise
 
-    # Step 2: Full child update with line items, PO, metafields, etc.
     child_update = build_child_update_payload(live_draft, eval_data["available_lines"], child_po)
     try:
         child = update_draft(child["id"], child_update)
@@ -1396,7 +1395,6 @@ def process_draft(draft: Dict[str, Any], availability_by_item: Dict[str, int]) -
         child.get("poNumber") or child_po,
     )
 
-    # Step 3: Update the parent with remaining lines + done tag.
     parent_input = build_parent_update_payload(live_draft, eval_data["remaining_lines"])
     update_draft(live_draft["id"], parent_input)
     logger.info("%s | parent updated with remaining lines", name)
@@ -1438,6 +1436,7 @@ def main() -> None:
     logger.info("MIN_REMAINING_LINES=%s", MIN_REMAINING_LINES)
     logger.info("MAX_SPLIT_DEPTH=%s", MAX_SPLIT_DEPTH)
     logger.info("EXCLUDE_SKUS=%s", sorted(EXCLUDE_SKUS) if EXCLUDE_SKUS else "(none)")
+    logger.info("EXCLUDE_CUSTOMERS=%s", sorted(EXCLUDE_CUSTOMERS) if EXCLUDE_CUSTOMERS else "(none)")
     logger.info("LINEAGE_NAMESPACE=%s", LINEAGE_NAMESPACE)
     logger.info("CSV_LOG_PATH=%s", CSV_LOG_PATH)
 
