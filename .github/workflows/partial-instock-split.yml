@@ -30,6 +30,7 @@ jobs:
           MIN_REMAINING_LINES: ${{ vars.MIN_REMAINING_LINES }}
           MAX_SPLIT_DEPTH: ${{ vars.MAX_SPLIT_DEPTH }}
           EXCLUDE_SKUS: ${{ vars.EXCLUDE_SKUS }}
+          EXCLUDE_CUSTOMER: ${{ vars.EXCLUDE_CUSTOMER }}
           PARTIAL_PARENT_TAG: ${{ vars.PARTIAL_PARENT_TAG }}
           PARTIAL_CHILD_TAG: ${{ vars.PARTIAL_CHILD_TAG }}
           PROCESSING_TAG: ${{ vars.PROCESSING_TAG }}
