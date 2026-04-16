@@ -1127,3 +1127,5 @@ timestamp_utc,parent_draft_id,parent_draft_name,parent_po,child_draft_id,child_d
 2026-04-16T14:13:37+00:00,gid://shopify/DraftOrder/1505305133422,#D17138,LL020226-SB- BO3,gid://shopify/DraftOrder/DRY_RUN,,LL020226-SB- BO3.2,,4,4,208.0,416.0,50.00,1,2,partial_instock_split,true
 2026-04-16T16:51:10+00:00,gid://shopify/DraftOrder/1505305133422,#D17138,LL020226-SB- BO3,gid://shopify/DraftOrder/DRY_RUN,,LL020226-SB- BO3.2,,4,4,208.0,416.0,50.00,1,2,partial_instock_split,true
 2026-04-16T19:40:05+00:00,gid://shopify/DraftOrder/1505305133422,#D17138,LL020226-SB- BO3,gid://shopify/DraftOrder/DRY_RUN,,LL020226-SB- BO3.2,,4,4,208.0,416.0,50.00,1,2,partial_instock_split,true
+2026-04-16T22:01:11+00:00,gid://shopify/DraftOrder/1505305133422,#D17138,LL020226-SB- BO3,gid://shopify/DraftOrder/DRY_RUN,,LL020226-SB- BO3.2,,4,4,208.0,416.0,50.00,1,2,partial_instock_split,true
+2026-04-16T22:04:49+00:00,gid://shopify/DraftOrder/1514088137070,#D21109,cchg41626,gid://shopify/DraftOrder/DRY_RUN,,cchg41626-BO,2026-04-16,10,2,562.0,692.0,81.21,0,1,partial_instock_split,true
