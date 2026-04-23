@@ -36,11 +36,42 @@ EXCLUDE_SKUS: Set[str] = {
     if s.strip()
 }
 
-EXCLUDE_CUSTOMERS: Set[str] = {
+# Prefer the new standardized var name, but allow backward compatibility.
+_raw_excluded_customers = (
+    os.getenv("EXCLUDED_CUSTOMERS")
+    or os.getenv("EXCLUDE_CUSTOMER")
+    or ""
+)
+EXCLUDED_CUSTOMERS: Set[str] = {
     s.strip().lower()
-    for s in os.getenv("EXCLUDE_CUSTOMER", "").split(",")
+    for s in _raw_excluded_customers.split(",")
     if s.strip()
 }
+
+DEFAULT_EXCLUDED_CUSTOMER_SUBSTRINGS: Set[str] = {
+    "faire",
+    "faire marketplace",
+    "customer samples",
+    "tjx",
+    "tjx canada",
+    "tjx companies",
+    "replacements",
+    "replacements and customer care",
+    "replacements customer care customer care",
+    "noreen batdorf",
+    "batdorf",
+    "norman's hallmark",
+}
+
+_raw_excluded_customer_substrings = os.getenv("EXCLUDED_CUSTOMER_SUBSTRINGS", "")
+EXCLUDED_CUSTOMER_SUBSTRINGS: Set[str] = {
+    s.strip().lower()
+    for s in _raw_excluded_customer_substrings.split(",")
+    if s.strip()
+}
+EXCLUDED_CUSTOMER_SUBSTRINGS = (
+    EXCLUDED_CUSTOMER_SUBSTRINGS.union(DEFAULT_EXCLUDED_CUSTOMER_SUBSTRINGS)
+)
 
 PARTIAL_PARENT_TAG = os.getenv("PARTIAL_PARENT_TAG", "partial-instock-split-done").strip()
 PARTIAL_CHILD_TAG = os.getenv("PARTIAL_CHILD_TAG", "partial-instock-child").strip()
@@ -212,6 +243,13 @@ def get_nested(d: Dict[str, Any], *keys: str) -> Any:
         if cur is None:
             return None
     return cur
+
+
+def normalize_text(value: Any) -> str:
+    text = "" if value is None else str(value)
+    text = text.strip().lower()
+    text = re.sub(r"\s+", " ", text)
+    return text
 
 
 # ----------------------------
@@ -1051,29 +1089,94 @@ def has_excluded_sku(draft: Dict[str, Any]) -> bool:
     return False
 
 
-def has_excluded_customer(draft: Dict[str, Any]) -> bool:
-    if not EXCLUDE_CUSTOMERS:
-        return False
+def build_excluded_customer_haystack(draft: Dict[str, Any]) -> List[str]:
+    vals: List[str] = []
 
     customer = draft.get("customer") or {}
 
     first_name = str(customer.get("firstName") or "").strip()
     last_name = str(customer.get("lastName") or "").strip()
-    full_name = f"{first_name} {last_name}".strip().lower()
-    display_name = str(customer.get("displayName") or "").strip().lower()
-    email = str(customer.get("email") or "").strip().lower()
+    full_name = f"{first_name} {last_name}".strip()
+    display_name = str(customer.get("displayName") or "").strip()
+    email = str(customer.get("email") or "").strip()
 
-    candidates = {x for x in [full_name, display_name, email] if x}
+    for v in [first_name, last_name, full_name, display_name, email]:
+        if v:
+            vals.append(v)
 
-    matched = candidates.intersection(EXCLUDE_CUSTOMERS)
-    if matched:
+    po = str(draft.get("poNumber") or "").strip()
+    if po:
+        vals.append(po)
+
+    note = str(draft.get("note2") or "").strip()
+    if note:
+        vals.append(note)
+
+    for tag in normalize_tags(draft.get("tags", [])):
+        vals.append(tag)
+
+    for attr in (draft.get("customAttributes") or []):
+        k = str(attr.get("key") or "").strip()
+        v = str(attr.get("value") or "").strip()
+        if k:
+            vals.append(k)
+        if v:
+            vals.append(v)
+
+    for mf in ((draft.get("metafields") or {}).get("nodes") or []):
+        ns = str(mf.get("namespace") or "").strip()
+        key = str(mf.get("key") or "").strip()
+        value = str(mf.get("value") or "").strip()
+        if ns:
+            vals.append(ns)
+        if key:
+            vals.append(key)
+        if value:
+            vals.append(value)
+
+    deduped: List[str] = []
+    seen: Set[str] = set()
+    for v in vals:
+        nv = normalize_text(v)
+        if not nv or nv in seen:
+            continue
+        seen.add(nv)
+        deduped.append(v)
+
+    return deduped
+
+
+def has_excluded_customer(draft: Dict[str, Any]) -> bool:
+    if not EXCLUDED_CUSTOMERS and not EXCLUDED_CUSTOMER_SUBSTRINGS:
+        return False
+
+    haystack_values = build_excluded_customer_haystack(draft)
+    haystack_norm = [normalize_text(x) for x in haystack_values if normalize_text(x)]
+    haystack_joined = " | ".join(haystack_norm)
+
+    exact_matches = sorted(set(haystack_norm).intersection(EXCLUDED_CUSTOMERS))
+    substring_matches = sorted(
+        s for s in EXCLUDED_CUSTOMER_SUBSTRINGS
+        if s and s in haystack_joined
+    )
+
+    if exact_matches or substring_matches:
         logger.info(
-            "%s | contains excluded customer: %s",
+            "%s | excluded customer matched | exact=%s | substring=%s | haystack=%s",
             draft.get("name", "(unknown)"),
-            ", ".join(sorted(matched)),
+            exact_matches,
+            substring_matches,
+            haystack_values,
         )
         return True
 
+    logger.info(
+        "%s | exclusion candidates=%s | exact_matches=%s | substring_matches=%s",
+        draft.get("name", "(unknown)"),
+        haystack_values,
+        exact_matches,
+        substring_matches,
+    )
     return False
 
 
@@ -1436,7 +1539,11 @@ def main() -> None:
     logger.info("MIN_REMAINING_LINES=%s", MIN_REMAINING_LINES)
     logger.info("MAX_SPLIT_DEPTH=%s", MAX_SPLIT_DEPTH)
     logger.info("EXCLUDE_SKUS=%s", sorted(EXCLUDE_SKUS) if EXCLUDE_SKUS else "(none)")
-    logger.info("EXCLUDE_CUSTOMERS=%s", sorted(EXCLUDE_CUSTOMERS) if EXCLUDE_CUSTOMERS else "(none)")
+    logger.info("EXCLUDED_CUSTOMERS=%s", sorted(EXCLUDED_CUSTOMERS) if EXCLUDED_CUSTOMERS else "(none)")
+    logger.info(
+        "EXCLUDED_CUSTOMER_SUBSTRINGS=%s",
+        sorted(EXCLUDED_CUSTOMER_SUBSTRINGS) if EXCLUDED_CUSTOMER_SUBSTRINGS else "(none)",
+    )
     logger.info("LINEAGE_NAMESPACE=%s", LINEAGE_NAMESPACE)
     logger.info("CSV_LOG_PATH=%s", CSV_LOG_PATH)
 
