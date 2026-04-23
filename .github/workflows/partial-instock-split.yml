@@ -1,36 +1,64 @@
 name: Partial In-Stock Split
+
 on:
   workflow_dispatch:
   schedule:
     - cron: "15 12-21/3 * * 1-5"
+
 permissions:
   contents: write
+
 jobs:
   partial-instock-split:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      - name: Debug env presence
+        shell: bash
+        env:
+          SHOPIFY_SHOP: ${{ secrets.SHOPIFY_SHOP }}
+          SHOPIFY_TOKEN: ${{ secrets.SHOPIFY_TOKEN }}
+          SHOPIFY_LOCATION_ID: ${{ secrets.SHOPIFY_LOCATION_ID }}
+          SHOPIFY_API_VERSION: ${{ secrets.SHOPIFY_API_VERSION }}
+          EXCLUDED_CUSTOMERS: ${{ vars.EXCLUDED_CUSTOMERS }}
+          EXCLUDED_CUSTOMER_SUBSTRINGS: ${{ vars.EXCLUDED_CUSTOMER_SUBSTRINGS }}
+        run: |
+          echo "SHOPIFY_SHOP set? -> $([[ -n "$SHOPIFY_SHOP" ]] && echo YES || echo NO)"
+          echo "SHOPIFY_TOKEN set? -> $([[ -n "$SHOPIFY_TOKEN" ]] && echo YES || echo NO)"
+          echo "SHOPIFY_LOCATION_ID set? -> $([[ -n "$SHOPIFY_LOCATION_ID" ]] && echo YES || echo NO)"
+          echo "SHOPIFY_API_VERSION -> ${SHOPIFY_API_VERSION:-MISSING}"
+          echo "EXCLUDED_CUSTOMERS -> ${EXCLUDED_CUSTOMERS:-MISSING}"
+          echo "EXCLUDED_CUSTOMER_SUBSTRINGS -> ${EXCLUDED_CUSTOMER_SUBSTRINGS:-MISSING}"
+
       - name: Run partial in-stock split
         env:
           SHOPIFY_SHOP: ${{ secrets.SHOPIFY_SHOP }}
           SHOPIFY_TOKEN: ${{ secrets.SHOPIFY_TOKEN }}
           SHOPIFY_LOCATION_ID: ${{ secrets.SHOPIFY_LOCATION_ID }}
           SHOPIFY_API_VERSION: ${{ secrets.SHOPIFY_API_VERSION }}
+
           DRY_RUN: ${{ vars.DRY_RUN }}
           MIN_AVAILABLE_LINES: ${{ vars.MIN_AVAILABLE_LINES }}
           MIN_AVAILABLE_VALUE: ${{ vars.MIN_AVAILABLE_VALUE }}
           MIN_AVAILABLE_PERCENT: ${{ vars.MIN_AVAILABLE_PERCENT }}
           MIN_REMAINING_LINES: ${{ vars.MIN_REMAINING_LINES }}
           MAX_SPLIT_DEPTH: ${{ vars.MAX_SPLIT_DEPTH }}
+
           EXCLUDE_SKUS: ${{ vars.EXCLUDE_SKUS }}
-          EXCLUDE_CUSTOMER: ${{ vars.EXCLUDE_CUSTOMER }}
+          EXCLUDED_CUSTOMERS: ${{ vars.EXCLUDED_CUSTOMERS }}
+          EXCLUDED_CUSTOMER_SUBSTRINGS: ${{ vars.EXCLUDED_CUSTOMER_SUBSTRINGS }}
+
           PARTIAL_PARENT_TAG: ${{ vars.PARTIAL_PARENT_TAG }}
           PARTIAL_CHILD_TAG: ${{ vars.PARTIAL_CHILD_TAG }}
           PROCESSING_TAG: ${{ vars.PROCESSING_TAG }}
@@ -41,12 +69,14 @@ jobs:
           DRAFT_ORDER_NAMES: ${{ vars.DRAFT_ORDER_NAMES }}
           CSV_LOG_PATH: logs/partial_instock_split_history.csv
         run: python partial-instock-split.py
+
       - name: Upload CSV log artifact
         uses: actions/upload-artifact@v4
         with:
           name: partial-instock-split-log
           path: logs/partial_instock_split_history.csv
           if-no-files-found: ignore
+
       - name: Commit updated CSV log
         run: |
           git config user.name "github-actions[bot]"
