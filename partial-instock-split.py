@@ -30,9 +30,9 @@ MIN_AVAILABLE_PERCENT = Decimal(os.getenv("MIN_AVAILABLE_PERCENT", "0.30").strip
 MIN_REMAINING_LINES = int(os.getenv("MIN_REMAINING_LINES", "2").strip())
 MAX_SPLIT_DEPTH = int(os.getenv("MAX_SPLIT_DEPTH", "2").strip())
 
-EXCLUDE_SKUS: Set[str] = {
+EXCLUDED_SKUS: Set[str] = {
     s.strip().upper()
-    for s in os.getenv("EXCLUDE_SKUS", "").split(",")
+    for s in os.getenv("EXCLUDED_SKUS", "").split(",")
     if s.strip()
 }
 
@@ -1071,7 +1071,7 @@ def build_parent_update_payload(
 # SKU / customer exclusion check
 # ----------------------------
 def has_excluded_sku(draft: Dict[str, Any]) -> bool:
-    if not EXCLUDE_SKUS:
+    if not EXCLUDED_SKUS:
         return False
     for line in ((draft.get("lineItems") or {}).get("nodes") or []):
         sku = (
@@ -1079,7 +1079,7 @@ def has_excluded_sku(draft: Dict[str, Any]) -> bool:
             or get_nested(line, "variant", "sku")
             or ""
         ).strip().upper()
-        if sku and sku in EXCLUDE_SKUS:
+        if sku and sku in EXCLUDED_SKUS:
             logger.info(
                 "%s | contains excluded SKU: %s",
                 draft.get("name", "(unknown)"),
@@ -1538,7 +1538,7 @@ def main() -> None:
     logger.info("MIN_AVAILABLE_PERCENT=%s", MIN_AVAILABLE_PERCENT)
     logger.info("MIN_REMAINING_LINES=%s", MIN_REMAINING_LINES)
     logger.info("MAX_SPLIT_DEPTH=%s", MAX_SPLIT_DEPTH)
-    logger.info("EXCLUDE_SKUS=%s", sorted(EXCLUDE_SKUS) if EXCLUDE_SKUS else "(none)")
+    logger.info("EXCLUDED_SKUS=%s", sorted(EXCLUDED_SKUS) if EXCLUDED_SKUS else "(none)")
     logger.info("EXCLUDED_CUSTOMERS=%s", sorted(EXCLUDED_CUSTOMERS) if EXCLUDED_CUSTOMERS else "(none)")
     logger.info(
         "EXCLUDED_CUSTOMER_SUBSTRINGS=%s",
