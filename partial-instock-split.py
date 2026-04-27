@@ -4,6 +4,7 @@ import os
 import re
 import sys
 import time
+import uuid
 from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -80,6 +81,7 @@ READY_TAG = os.getenv("READY_TAG", "instock-ready").strip()
 NEEDS_REVIEW_TAG = os.getenv("NEEDS_REVIEW_TAG", "needs-review").strip()
 SUBMITTED_TAG = os.getenv("SUBMITTED_TAG", "order-submitted").strip()
 LINEAGE_NAMESPACE = os.getenv("LINEAGE_NAMESPACE", "automation").strip()
+PROCESSING_TOKEN_KEY = os.getenv("PROCESSING_TOKEN_KEY", "partial_split_processing_token").strip()
 
 _raw_draft_order_names = os.getenv("DRAFT_ORDER_NAMES", "").strip()
 # Set DRAFT_ORDER_NAMES=ALL to run open-ended across all eligible drafts.
@@ -1266,19 +1268,94 @@ def should_split(draft: Dict[str, Any], eval_data: Dict[str, Any]) -> Tuple[bool
     return (len(reasons) == 0), reasons
 
 
+
+def draft_line_nodes(draft: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return list(((draft.get("lineItems") or {}).get("nodes") or []))
+
+
+def calculate_draft_line_value(draft: Dict[str, Any]) -> Decimal:
+    total = Decimal("0")
+    for line in draft_line_nodes(draft):
+        qty = int(line.get("quantity") or 0)
+        total += get_line_unit_price(line) * Decimal(qty)
+    return total
+
+
+def line_allocation_key(line: Dict[str, Any]) -> Tuple[str, str, str, str, str]:
+    """
+    Stable-enough identity for reconciliation after Shopify creates new line IDs.
+    We compare variant/SKU/title/unit price/discount so the child + parent must
+    contain the same sellable lines and quantities as the original parent.
+    """
+    variant = line.get("variant") or {}
+    variant_id = str(variant.get("id") or "")
+    sku = str(line.get("sku") or variant.get("sku") or "").strip().upper()
+    title = safe_single_line_text(line.get("title") or variant.get("title") or "")
+    unit_price = str(get_line_unit_price(line))
+    discount = repr(build_discount_payload(line.get("appliedDiscount")))
+    return (variant_id, sku, title, unit_price, discount)
+
+
+def line_quantity_map(lines: Sequence[Dict[str, Any]]) -> Dict[Tuple[str, str, str, str, str], int]:
+    out: Dict[Tuple[str, str, str, str, str], int] = {}
+    for line in lines:
+        key = line_allocation_key(line)
+        out[key] = out.get(key, 0) + int(line.get("quantity") or 0)
+    return out
+
+
+def verify_split_reconciliation(
+    original_parent: Dict[str, Any],
+    updated_parent: Dict[str, Any],
+    updated_child: Dict[str, Any],
+) -> Tuple[bool, List[str]]:
+    """
+    Verify that the split preserved value and line quantities.
+
+    This does not submit/release anything. It is a final fail-closed guard after
+    the parent and child drafts have been edited. If this fails, the caller tags
+    both drafts for manual review so no downstream release workflow should touch
+    them without human inspection.
+    """
+    reasons: List[str] = []
+    original_total = calculate_draft_line_value(original_parent)
+    parent_total = calculate_draft_line_value(updated_parent)
+    child_total = calculate_draft_line_value(updated_child)
+    combined_total = parent_total + child_total
+
+    if abs(original_total - combined_total) > Decimal("0.01"):
+        reasons.append(
+            f"value mismatch: original={original_total} parent={parent_total} "
+            f"child={child_total} combined={combined_total}"
+        )
+
+    original_map = line_quantity_map(draft_line_nodes(original_parent))
+    combined_map = line_quantity_map(draft_line_nodes(updated_parent) + draft_line_nodes(updated_child))
+    if original_map != combined_map:
+        reasons.append("line quantity allocation mismatch between original and parent+child")
+
+    return (len(reasons) == 0), reasons
+
 def claim_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Atomically mark a draft as in-progress.
+    Safely mark a draft as in-progress before any duplicate is created.
 
-    1. Re-fetch live state from the API (bypasses stale snapshot).
-    2. Verify no disqualifying tags have appeared since fetch.
-    3. Write PROCESSING_TAG and verify it landed.
-    4. Check that no disqualifying tags appeared during the write
-       window.
-    5. Return the freshly-fetched draft.
+    This is intentionally fail-closed because duplicate customer orders are worse
+    than a missed split. A shared processing tag by itself is not a true lock:
+    two concurrent runs can both write the same tag and both verify it. To avoid
+    that, each claim writes a unique token metafield and only the run that reads
+    back its own token is allowed to continue.
+
+    Steps:
+    1. Re-fetch live state from Shopify.
+    2. Verify no disqualifying tags have appeared.
+    3. Write PROCESSING_TAG plus a unique ownership token metafield.
+    4. Re-fetch with retries and verify both the tag and this run's token.
+    5. Return the verified, post-claim draft.
     """
     draft_id = draft["id"]
     name = draft.get("name", draft_id)
+    claim_token = str(uuid.uuid4())
 
     live = fetch_draft_fresh(draft_id)
     if live is None:
@@ -1298,25 +1375,60 @@ def claim_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
                 "appeared since initial fetch"
             )
 
-    update_draft(
+    updated = update_draft(
         draft_id,
-        {"tags": add_tags(live.get("tags", []), PROCESSING_TAG)},
+        {
+            "tags": add_tags(live.get("tags", []), PROCESSING_TAG),
+            "metafields": [
+                {
+                    "namespace": LINEAGE_NAMESPACE,
+                    "key": PROCESSING_TOKEN_KEY,
+                    "type": "single_line_text_field",
+                    "value": claim_token,
+                }
+            ],
+        },
+    )
+    logger.info(
+        "%s | claim write returned tags=%r token_key=%s token=%s",
+        name,
+        updated.get("tags"),
+        PROCESSING_TOKEN_KEY,
+        claim_token,
     )
 
     if DRY_RUN:
         return live
 
-    verify = fetch_draft_fresh(draft_id)
-    if verify is None:
-        raise RuntimeError(
-            f"{name} | claim verification failed | draft disappeared after tag write"
+    verify: Optional[Dict[str, Any]] = None
+    verify_tags_lower: Set[str] = set()
+
+    for attempt in range(1, 5):
+        time.sleep(min(attempt * 1.5, 6))
+        verify = fetch_draft_fresh(draft_id)
+        if verify is None:
+            raise RuntimeError(
+                f"{name} | claim verification failed | draft disappeared after tag write"
+            )
+
+        verify_tags_lower = {t.lower() for t in normalize_tags(verify.get("tags", []))}
+        verify_token = get_metafield_value(verify, LINEAGE_NAMESPACE, PROCESSING_TOKEN_KEY)
+
+        logger.info(
+            "%s | claim verify attempt %s | has_processing_tag=%s | token_match=%s | tags=%r",
+            name,
+            attempt,
+            PROCESSING_TAG.lower() in verify_tags_lower,
+            verify_token == claim_token,
+            verify.get("tags"),
         )
 
-    verify_tags_lower = {t.lower() for t in normalize_tags(verify.get("tags", []))}
-
-    if PROCESSING_TAG.lower() not in verify_tags_lower:
+        if PROCESSING_TAG.lower() in verify_tags_lower and verify_token == claim_token:
+            break
+    else:
         raise RuntimeError(
-            f"{name} | claim verification failed | PROCESSING_TAG not present after write"
+            f"{name} | claim verification failed | PROCESSING_TAG or ownership token "
+            "not present after write"
         )
 
     for excluded_tag in EXCLUDE_TAGS:
@@ -1342,9 +1454,8 @@ def claim_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
                 "appeared during claim write window"
             )
 
-    logger.info("%s | claimed successfully (live tag verified, no race detected)", name)
-    return live
-
+    logger.info("%s | claimed successfully (tag and ownership token verified)", name)
+    return verify
 
 def process_draft(draft: Dict[str, Any], availability_by_item: Dict[str, int]) -> None:
     name = draft.get("name", draft.get("id", "<unknown>"))
@@ -1362,12 +1473,27 @@ def process_draft(draft: Dict[str, Any], availability_by_item: Dict[str, int]) -
         logger.info("%s | skipped | contains excluded customer", name)
         return
 
+    ship_date_raw = get_metafield_value(draft, "b2b", "ship_date") or ""
+    skip_for_ship_date, ship_date_reason = should_skip_for_ship_date(draft)
+    if skip_for_ship_date:
+        logger.info("%s | skipped | %s", name, ship_date_reason)
+        return
+
     logger.info("\nProcessing %s (DRY_RUN=%s)", name, DRY_RUN)
 
-    parent_po = (draft.get("poNumber") or "").strip()
-
     try:
-        existing_child = find_existing_child_for_parent(draft["id"], parent_po)
+        live_draft = claim_draft(draft)
+    except RuntimeError as claim_exc:
+        logger.warning("%s | skipped | %s", name, claim_exc)
+        return
+
+    # Once claimed, check for an existing child. This ordering matters: doing the
+    # orphan/child search before the lock leaves a race window where two runs can
+    # both find no child and then both duplicate. The unique claim token closes
+    # that window.
+    parent_po = (live_draft.get("poNumber") or "").strip()
+    try:
+        existing_child = find_existing_child_for_parent(live_draft["id"], parent_po)
     except RuntimeError as search_exc:
         logger.error(
             "%s | HALTED | orphan search failed — cannot safely proceed. "
@@ -1377,15 +1503,17 @@ def process_draft(draft: Dict[str, Any], availability_by_item: Dict[str, int]) -
             search_exc,
         )
         try:
-            live_tags = normalize_tags(draft.get("tags", []))
-            update_draft(draft["id"], {"tags": add_tags(live_tags, NEEDS_REVIEW_TAG)})
+            update_draft(
+                live_draft["id"],
+                {"tags": add_tags(remove_tags(live_draft.get("tags", []), PROCESSING_TAG), NEEDS_REVIEW_TAG)},
+            )
         except Exception as tag_exc:
             logger.warning("%s | failed to apply needs-review tag: %s", name, tag_exc)
         return
 
     if existing_child is not None:
         logger.error(
-            "%s | HALTED | orphaned child draft %s already exists for this parent. "
+            "%s | HALTED | child draft %s already exists for this parent. "
             "This likely means a previous run partially succeeded. "
             "Manually review both drafts before re-running. "
             "Tagging parent with '%s'.",
@@ -1394,25 +1522,22 @@ def process_draft(draft: Dict[str, Any], availability_by_item: Dict[str, int]) -
             NEEDS_REVIEW_TAG,
         )
         try:
-            live_tags = normalize_tags(draft.get("tags", []))
-            update_draft(draft["id"], {"tags": add_tags(live_tags, NEEDS_REVIEW_TAG)})
+            update_draft(
+                live_draft["id"],
+                {"tags": add_tags(remove_tags(live_draft.get("tags", []), PROCESSING_TAG), NEEDS_REVIEW_TAG)},
+            )
         except Exception as tag_exc:
             logger.warning("%s | failed to apply needs-review tag: %s", name, tag_exc)
         return
 
-    ship_date_raw = get_metafield_value(draft, "b2b", "ship_date") or ""
-    skip_for_ship_date, ship_date_reason = should_skip_for_ship_date(draft)
-    if skip_for_ship_date:
-        logger.info("%s | skipped | %s", name, ship_date_reason)
-        return
+    # Use fresh inventory for this claimed draft so the child only contains lines
+    # that can be released now. The broad prefetch is still useful for logging and
+    # as a fallback, but this prevents an old run-level snapshot from driving the
+    # split decision.
+    live_inventory_ids = collect_inventory_ids([live_draft])
+    live_availability = fetch_inventory_availability(live_inventory_ids) if live_inventory_ids else availability_by_item
 
-    try:
-        live_draft = claim_draft(draft)
-    except RuntimeError as claim_exc:
-        logger.warning("%s | skipped | %s", name, claim_exc)
-        return
-
-    eval_data = evaluate_draft(live_draft, availability_by_item)
+    eval_data = evaluate_draft(live_draft, live_availability)
     should_run, reasons = should_split(live_draft, eval_data)
 
     logger.info(
@@ -1499,8 +1624,69 @@ def process_draft(draft: Dict[str, Any], availability_by_item: Dict[str, int]) -
     )
 
     parent_input = build_parent_update_payload(live_draft, eval_data["remaining_lines"])
-    update_draft(live_draft["id"], parent_input)
-    logger.info("%s | parent updated with remaining lines", name)
+    try:
+        parent_after_update = update_draft(live_draft["id"], parent_input)
+        logger.info("%s | parent updated with remaining lines", name)
+    except Exception as exc:
+        logger.error(
+            "%s | parent update failed after child %s was created — rolling back child: %s",
+            name,
+            child.get("id"),
+            exc,
+        )
+        delete_draft(child["id"])
+        try:
+            update_draft(
+                live_draft["id"],
+                {"tags": remove_tags(live_draft.get("tags", []), PROCESSING_TAG)},
+            )
+        except Exception as untag_exc:
+            logger.error(
+                "%s | CRITICAL: could not remove PROCESSING_TAG after parent-update rollback. Error: %s",
+                name,
+                untag_exc,
+            )
+        raise
+
+    if not DRY_RUN:
+        refreshed_parent = fetch_draft_fresh(live_draft["id"]) or parent_after_update
+        refreshed_child = fetch_draft_fresh(child["id"]) or child
+        reconciled, reconciliation_reasons = verify_split_reconciliation(
+            live_draft,
+            refreshed_parent,
+            refreshed_child,
+        )
+        if not reconciled:
+            logger.error(
+                "%s | RECONCILIATION FAILED | %s | tagging parent and child with %s",
+                name,
+                reconciliation_reasons,
+                NEEDS_REVIEW_TAG,
+            )
+            try:
+                update_draft(
+                    refreshed_parent["id"],
+                    {"tags": add_tags(remove_tags(refreshed_parent.get("tags", []), PROCESSING_TAG, READY_TAG), NEEDS_REVIEW_TAG)},
+                )
+            except Exception as tag_exc:
+                logger.error("%s | failed to tag parent after reconciliation failure: %s", name, tag_exc)
+            try:
+                update_draft(
+                    refreshed_child["id"],
+                    {"tags": add_tags(remove_tags(refreshed_child.get("tags", []), READY_TAG), NEEDS_REVIEW_TAG)},
+                )
+            except Exception as tag_exc:
+                logger.error("%s | failed to tag child after reconciliation failure: %s", name, tag_exc)
+            raise RuntimeError(f"{name} | reconciliation failed | {reconciliation_reasons}")
+
+        logger.info(
+            "%s | reconciliation passed | original_total=%s parent_total=%s child_total=%s combined_total=%s",
+            name,
+            calculate_draft_line_value(live_draft),
+            calculate_draft_line_value(refreshed_parent),
+            calculate_draft_line_value(refreshed_child),
+            calculate_draft_line_value(refreshed_parent) + calculate_draft_line_value(refreshed_child),
+        )
 
     append_split_log_row(
         parent=live_draft,
@@ -1509,7 +1695,6 @@ def process_draft(draft: Dict[str, Any], availability_by_item: Dict[str, int]) -
         ship_date=ship_date_raw,
         child_po=child_po,
     )
-
 
 def collect_inventory_ids(drafts: List[Dict[str, Any]]) -> List[str]:
     ids: List[str] = []
@@ -1545,6 +1730,7 @@ def main() -> None:
         sorted(EXCLUDED_CUSTOMER_SUBSTRINGS) if EXCLUDED_CUSTOMER_SUBSTRINGS else "(none)",
     )
     logger.info("LINEAGE_NAMESPACE=%s", LINEAGE_NAMESPACE)
+    logger.info("PROCESSING_TOKEN_KEY=%s", PROCESSING_TOKEN_KEY)
     logger.info("CSV_LOG_PATH=%s", CSV_LOG_PATH)
 
     drafts = fetch_open_drafts()
