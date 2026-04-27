@@ -740,6 +740,94 @@ def update_draft(draft_id: str, input_payload: Dict[str, Any]) -> Dict[str, Any]
     return payload["draftOrder"]
 
 
+def stable_tag_list(tags: Any) -> List[str]:
+    """
+    Match the known-stable tagging scripts: construct the complete desired tag
+    list and send it through draftOrderUpdate(input={"tags": final_tags}).
+    Shopify treats this as the full tag set, so callers must pass all tags that
+    should remain on the draft.
+    """
+    if tags is None:
+        return []
+    if isinstance(tags, str):
+        raw = tags.split(",")
+    elif isinstance(tags, Sequence):
+        raw = list(tags)
+    else:
+        raw = []
+
+    clean: Set[str] = set()
+    for tag in raw:
+        val = str(tag or "").strip()
+        if val:
+            clean.add(val)
+    return sorted(clean)
+
+
+def update_draft_tags_full(
+    draft_id: str,
+    final_tags: Any,
+    *,
+    label: str = "update tags",
+) -> Dict[str, Any]:
+    """
+    Stable tag-write path copied from the working splitter/tagger style:
+    draftOrderUpdate(id, input={"tags": final_tags}).
+    """
+    desired_tags = stable_tag_list(final_tags)
+    logger.info("Updating tags via draftOrderUpdate for %s (%s) -> %s", label, draft_id, desired_tags)
+    updated = update_draft(draft_id, {"tags": desired_tags})
+    logger.info("Updated tags for %s (%s) returned=%r", label, draft_id, updated.get("tags"))
+    return updated
+
+
+def add_draft_tags(
+    draft_id: str,
+    current_tags: Any,
+    tags_to_add: Sequence[str],
+    *,
+    label: str = "add tags",
+) -> Dict[str, Any]:
+    desired = stable_tag_list(list(normalize_tags(current_tags)) + [t for t in tags_to_add if t])
+    return update_draft_tags_full(draft_id, desired, label=label)
+
+
+def remove_draft_tags(
+    draft_id: str,
+    current_tags: Any,
+    tags_to_remove: Sequence[str],
+    *,
+    label: str = "remove tags",
+) -> Dict[str, Any]:
+    remove_lower = {str(t or "").strip().lower() for t in tags_to_remove if str(t or "").strip()}
+    desired = [t for t in normalize_tags(current_tags) if t.lower() not in remove_lower]
+    return update_draft_tags_full(draft_id, desired, label=label)
+
+
+def add_tags_to_fresh_draft(
+    draft_id: str,
+    tags_to_add: Sequence[str],
+    *,
+    label: str = "add tags fresh",
+) -> Dict[str, Any]:
+    fresh = fetch_draft_fresh(draft_id)
+    if fresh is None:
+        raise RuntimeError(f"{label} failed: draft {draft_id} not found or no longer OPEN")
+    return add_draft_tags(draft_id, fresh.get("tags", []), tags_to_add, label=label)
+
+
+def remove_tags_from_fresh_draft(
+    draft_id: str,
+    tags_to_remove: Sequence[str],
+    *,
+    label: str = "remove tags fresh",
+) -> Dict[str, Any]:
+    fresh = fetch_draft_fresh(draft_id)
+    if fresh is None:
+        raise RuntimeError(f"{label} failed: draft {draft_id} not found or no longer OPEN")
+    return remove_draft_tags(draft_id, fresh.get("tags", []), tags_to_remove, label=label)
+
+
 def duplicate_draft(parent_id: str) -> Dict[str, Any]:
     """
     Duplicate a draft order via draftOrderDuplicate.
@@ -1029,10 +1117,6 @@ def build_child_update_payload(
     available_lines: List[Dict[str, Any]],
     child_po: str,
 ) -> Dict[str, Any]:
-    tags = normalize_tags(parent.get("tags", []))
-    tags = remove_tags(tags, PROCESSING_TAG, PARTIAL_PARENT_TAG)
-    tags = add_tags(tags, PARTIAL_CHILD_TAG)
-
     custom_attributes = [
         {
             "key": str(attr.get("key", "")).strip(),
@@ -1044,7 +1128,6 @@ def build_child_update_payload(
 
     payload: Dict[str, Any] = {
         "lineItems": [build_line_payload(line) for line in available_lines],
-        "tags": tags,
         "poNumber": child_po,
         "metafields": build_child_metafields(parent, child_po),
     }
@@ -1059,13 +1142,8 @@ def build_parent_update_payload(
     parent: Dict[str, Any],
     remaining_lines: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    tags = normalize_tags(parent.get("tags", []))
-    tags = remove_tags(tags, PROCESSING_TAG)
-    tags = add_tags(tags, PARTIAL_PARENT_TAG)
-
     return {
         "lineItems": [build_line_payload(line) for line in remaining_lines],
-        "tags": tags,
     }
 
 
@@ -1375,10 +1453,11 @@ def claim_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
                 "appeared since initial fetch"
             )
 
-    updated = update_draft(
+    # Write the ownership token first. If two runs race, the last token wins;
+    # only the run that reads back its own token is allowed to continue.
+    update_draft(
         draft_id,
         {
-            "tags": add_tags(live.get("tags", []), PROCESSING_TAG),
             "metafields": [
                 {
                     "namespace": LINEAGE_NAMESPACE,
@@ -1389,10 +1468,17 @@ def claim_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
             ],
         },
     )
+
+    claimed_tags = stable_tag_list(add_tags(live.get("tags", []), PROCESSING_TAG))
+    updated_tags = update_draft_tags_full(
+        draft_id,
+        claimed_tags,
+        label="claim processing lock",
+    )
     logger.info(
         "%s | claim write returned tags=%r token_key=%s token=%s",
         name,
-        updated.get("tags"),
+        updated_tags.get("tags"),
         PROCESSING_TOKEN_KEY,
         claim_token,
     )
@@ -1439,10 +1525,7 @@ def claim_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
                 excluded_tag,
             )
             try:
-                update_draft(
-                    draft_id,
-                    {"tags": remove_tags(verify.get("tags", []), PROCESSING_TAG)},
-                )
+                remove_tags_from_fresh_draft(draft_id, [PROCESSING_TAG], label="claim race remove processing")
             except Exception as untag_exc:
                 logger.error(
                     "%s | failed to remove PROCESSING_TAG after race back-off: %s",
@@ -1503,10 +1586,8 @@ def process_draft(draft: Dict[str, Any], availability_by_item: Dict[str, int]) -
             search_exc,
         )
         try:
-            update_draft(
-                live_draft["id"],
-                {"tags": add_tags(remove_tags(live_draft.get("tags", []), PROCESSING_TAG), NEEDS_REVIEW_TAG)},
-            )
+            remove_tags_from_fresh_draft(live_draft["id"], [PROCESSING_TAG], label="remove processing before needs-review")
+            add_tags_to_fresh_draft(live_draft["id"], [NEEDS_REVIEW_TAG], label="tag needs-review")
         except Exception as tag_exc:
             logger.warning("%s | failed to apply needs-review tag: %s", name, tag_exc)
         return
@@ -1522,10 +1603,8 @@ def process_draft(draft: Dict[str, Any], availability_by_item: Dict[str, int]) -
             NEEDS_REVIEW_TAG,
         )
         try:
-            update_draft(
-                live_draft["id"],
-                {"tags": add_tags(remove_tags(live_draft.get("tags", []), PROCESSING_TAG), NEEDS_REVIEW_TAG)},
-            )
+            remove_tags_from_fresh_draft(live_draft["id"], [PROCESSING_TAG], label="remove processing before needs-review")
+            add_tags_to_fresh_draft(live_draft["id"], [NEEDS_REVIEW_TAG], label="tag needs-review")
         except Exception as tag_exc:
             logger.warning("%s | failed to apply needs-review tag: %s", name, tag_exc)
         return
@@ -1555,7 +1634,7 @@ def process_draft(draft: Dict[str, Any], availability_by_item: Dict[str, int]) -
 
     if not should_run:
         logger.info("%s | no split | reasons=%s", name, reasons)
-        update_draft(live_draft["id"], {"tags": remove_tags(live_draft.get("tags", []), PROCESSING_TAG)})
+        remove_tags_from_fresh_draft(live_draft["id"], [PROCESSING_TAG], label="remove processing")
         return
 
     child_po = build_child_po(live_draft.get("poNumber") or "")
@@ -1565,10 +1644,7 @@ def process_draft(draft: Dict[str, Any], availability_by_item: Dict[str, int]) -
     logger.info("%s | duplicated -> %s", name, child.get("name") or child.get("id"))
 
     try:
-        update_draft(
-            child["id"],
-            {"tags": add_tags(child.get("tags", []), PARTIAL_CHILD_TAG)},
-        )
+        add_draft_tags(child["id"], child.get("tags", []), [PARTIAL_CHILD_TAG], label="stub child tag")
         logger.info("%s | wrote stub PARTIAL_CHILD_TAG to child %s", name, child.get("id"))
     except Exception as stub_exc:
         logger.error(
@@ -1579,10 +1655,7 @@ def process_draft(draft: Dict[str, Any], availability_by_item: Dict[str, int]) -
         )
         delete_draft(child["id"])
         try:
-            update_draft(
-                live_draft["id"],
-                {"tags": remove_tags(live_draft.get("tags", []), PROCESSING_TAG)},
-            )
+            remove_tags_from_fresh_draft(live_draft["id"], [PROCESSING_TAG], label="remove processing")
             logger.info("%s | removed PROCESSING_TAG after failed stub tag write", name)
         except Exception as untag_exc:
             logger.error(
@@ -1603,10 +1676,7 @@ def process_draft(draft: Dict[str, Any], availability_by_item: Dict[str, int]) -
         )
         delete_draft(child["id"])
         try:
-            update_draft(
-                live_draft["id"],
-                {"tags": remove_tags(live_draft.get("tags", []), PROCESSING_TAG)},
-            )
+            remove_tags_from_fresh_draft(live_draft["id"], [PROCESSING_TAG], label="remove processing")
             logger.info("%s | removed PROCESSING_TAG after failed child update", name)
         except Exception as untag_exc:
             logger.error(
@@ -1626,7 +1696,10 @@ def process_draft(draft: Dict[str, Any], availability_by_item: Dict[str, int]) -
     parent_input = build_parent_update_payload(live_draft, eval_data["remaining_lines"])
     try:
         parent_after_update = update_draft(live_draft["id"], parent_input)
-        logger.info("%s | parent updated with remaining lines", name)
+        add_tags_to_fresh_draft(live_draft["id"], [PARTIAL_PARENT_TAG], label="tag parent done")
+        remove_tags_from_fresh_draft(live_draft["id"], [PROCESSING_TAG], label="remove processing after parent update")
+        parent_after_update = fetch_draft_fresh(live_draft["id"]) or parent_after_update
+        logger.info("%s | parent updated with remaining lines and tagged %s", name, PARTIAL_PARENT_TAG)
     except Exception as exc:
         logger.error(
             "%s | parent update failed after child %s was created — rolling back child: %s",
@@ -1636,10 +1709,7 @@ def process_draft(draft: Dict[str, Any], availability_by_item: Dict[str, int]) -
         )
         delete_draft(child["id"])
         try:
-            update_draft(
-                live_draft["id"],
-                {"tags": remove_tags(live_draft.get("tags", []), PROCESSING_TAG)},
-            )
+            remove_tags_from_fresh_draft(live_draft["id"], [PROCESSING_TAG], label="remove processing")
         except Exception as untag_exc:
             logger.error(
                 "%s | CRITICAL: could not remove PROCESSING_TAG after parent-update rollback. Error: %s",
@@ -1664,17 +1734,13 @@ def process_draft(draft: Dict[str, Any], availability_by_item: Dict[str, int]) -
                 NEEDS_REVIEW_TAG,
             )
             try:
-                update_draft(
-                    refreshed_parent["id"],
-                    {"tags": add_tags(remove_tags(refreshed_parent.get("tags", []), PROCESSING_TAG, READY_TAG), NEEDS_REVIEW_TAG)},
-                )
+                remove_tags_from_fresh_draft(refreshed_parent["id"], [PROCESSING_TAG, READY_TAG], label="reconciliation parent remove unsafe tags")
+                add_tags_to_fresh_draft(refreshed_parent["id"], [NEEDS_REVIEW_TAG], label="reconciliation parent needs-review")
             except Exception as tag_exc:
                 logger.error("%s | failed to tag parent after reconciliation failure: %s", name, tag_exc)
             try:
-                update_draft(
-                    refreshed_child["id"],
-                    {"tags": add_tags(remove_tags(refreshed_child.get("tags", []), READY_TAG), NEEDS_REVIEW_TAG)},
-                )
+                remove_tags_from_fresh_draft(refreshed_child["id"], [READY_TAG], label="reconciliation child remove ready")
+                add_tags_to_fresh_draft(refreshed_child["id"], [NEEDS_REVIEW_TAG], label="reconciliation child needs-review")
             except Exception as tag_exc:
                 logger.error("%s | failed to tag child after reconciliation failure: %s", name, tag_exc)
             raise RuntimeError(f"{name} | reconciliation failed | {reconciliation_reasons}")
