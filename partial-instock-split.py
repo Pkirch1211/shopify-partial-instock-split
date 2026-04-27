@@ -74,14 +74,21 @@ EXCLUDED_CUSTOMER_SUBSTRINGS = (
     EXCLUDED_CUSTOMER_SUBSTRINGS.union(DEFAULT_EXCLUDED_CUSTOMER_SUBSTRINGS)
 )
 
-PARTIAL_PARENT_TAG = os.getenv("PARTIAL_PARENT_TAG", "partial-instock-split-done").strip()
-PARTIAL_CHILD_TAG = os.getenv("PARTIAL_CHILD_TAG", "partial-instock-child").strip()
-PROCESSING_TAG = os.getenv("PROCESSING_TAG", "partial-instock-processing").strip()
-READY_TAG = os.getenv("READY_TAG", "instock-ready").strip()
-NEEDS_REVIEW_TAG = os.getenv("NEEDS_REVIEW_TAG", "needs-review").strip()
-SUBMITTED_TAG = os.getenv("SUBMITTED_TAG", "order-submitted").strip()
-LINEAGE_NAMESPACE = os.getenv("LINEAGE_NAMESPACE", "automation").strip()
-PROCESSING_TOKEN_KEY = os.getenv("PROCESSING_TOKEN_KEY", "partial_split_processing_token").strip()
+def env_str(name: str, default: str) -> str:
+    """Return a stripped env var, falling back when the env var is missing or blank."""
+    value = os.getenv(name, default)
+    value = str(value or "").strip()
+    return value or default
+
+
+PARTIAL_PARENT_TAG = env_str("PARTIAL_PARENT_TAG", "partial-instock-split-done")
+PARTIAL_CHILD_TAG = env_str("PARTIAL_CHILD_TAG", "partial-instock-child")
+PROCESSING_TAG = env_str("PROCESSING_TAG", "partial-instock-processing")
+READY_TAG = env_str("READY_TAG", "instock-ready")
+NEEDS_REVIEW_TAG = env_str("NEEDS_REVIEW_TAG", "needs-review")
+SUBMITTED_TAG = env_str("SUBMITTED_TAG", "order-submitted")
+LINEAGE_NAMESPACE = env_str("LINEAGE_NAMESPACE", "automation")
+PROCESSING_TOKEN_KEY = env_str("PROCESSING_TOKEN_KEY", "partial_split_processing_token")
 
 _raw_draft_order_names = os.getenv("DRAFT_ORDER_NAMES", "").strip()
 # Set DRAFT_ORDER_NAMES=ALL to run open-ended across all eligible drafts.
@@ -1469,7 +1476,23 @@ def claim_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
         },
     )
 
+    if not PROCESSING_TAG:
+        raise RuntimeError(f"{name} | internal config error | PROCESSING_TAG is blank")
+
     claimed_tags = stable_tag_list(add_tags(live.get("tags", []), PROCESSING_TAG))
+    if PROCESSING_TAG.lower() not in {t.lower() for t in claimed_tags}:
+        raise RuntimeError(
+            f"{name} | internal claim error | PROCESSING_TAG={PROCESSING_TAG!r} "
+            f"was not added to desired_tags={claimed_tags!r}"
+        )
+
+    logger.info(
+        "%s | claim desired tags include PROCESSING_TAG=%r -> %r",
+        name,
+        PROCESSING_TAG,
+        claimed_tags,
+    )
+
     updated_tags = update_draft_tags_full(
         draft_id,
         claimed_tags,
@@ -1795,6 +1818,12 @@ def main() -> None:
         "EXCLUDED_CUSTOMER_SUBSTRINGS=%s",
         sorted(EXCLUDED_CUSTOMER_SUBSTRINGS) if EXCLUDED_CUSTOMER_SUBSTRINGS else "(none)",
     )
+    logger.info("PARTIAL_PARENT_TAG=%s", PARTIAL_PARENT_TAG)
+    logger.info("PARTIAL_CHILD_TAG=%s", PARTIAL_CHILD_TAG)
+    logger.info("PROCESSING_TAG=%s", PROCESSING_TAG)
+    logger.info("READY_TAG=%s", READY_TAG)
+    logger.info("NEEDS_REVIEW_TAG=%s", NEEDS_REVIEW_TAG)
+    logger.info("SUBMITTED_TAG=%s", SUBMITTED_TAG)
     logger.info("LINEAGE_NAMESPACE=%s", LINEAGE_NAMESPACE)
     logger.info("PROCESSING_TOKEN_KEY=%s", PROCESSING_TOKEN_KEY)
     logger.info("CSV_LOG_PATH=%s", CSV_LOG_PATH)
