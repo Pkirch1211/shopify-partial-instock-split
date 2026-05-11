@@ -1257,3 +1257,6 @@ timestamp_utc,parent_draft_id,parent_draft_name,parent_po,child_draft_id,child_d
 2026-05-07T20:39:26+00:00,gid://shopify/DraftOrder/1519368077678,#D23514,025927 - BO1,gid://shopify/DraftOrder/1519651750254,#D23570,025927 - BO1.2,2026-05-06,2,2,52.0,137.0,37.96,1,2,partial_instock_split,false
 2026-05-07T20:39:43+00:00,gid://shopify/DraftOrder/1519544336750,#D23531,JM1141944 - BO1,gid://shopify/DraftOrder/1519651815790,#D23571,JM1141944 - BO1.2,2026-05-07,2,1,52.0,92.0,56.52,1,2,partial_instock_split,false
 2026-05-11T15:54:43+00:00,gid://shopify/DraftOrder/1505516093806,#D17535,01.09.26 BO - BO3,gid://shopify/DraftOrder/1520427008366,#D23629,01.09.26 BO - BO3.2,,1,2,180.0,429.0,41.96,1,2,partial_instock_split,false
+2026-05-11T20:09:19+00:00,gid://shopify/DraftOrder/1505205944686,#D16224,ODon BO Candle,gid://shopify/DraftOrder/1520501948782,#D23657,ODon BO Candle-BO,,1,1,45.0,90.0,50.00,0,1,partial_instock_split,false
+2026-05-11T20:26:08+00:00,gid://shopify/DraftOrder/1506706915694,#D18318,JD1617692 - BO5,gid://shopify/DraftOrder/1520506634606,#D23665,JD1617692 - BO5.2,,1,1,45.0,85.0,52.94,1,2,partial_instock_split,false
+2026-05-11T20:48:27+00:00,gid://shopify/DraftOrder/1519076475246,#D23452,LG50526DC - BO1,gid://shopify/DraftOrder/1520511484270,#D23666,LG50526DC - BO1.2,2026-05-05,1,1,45.0,69.0,65.22,1,2,partial_instock_split,false
