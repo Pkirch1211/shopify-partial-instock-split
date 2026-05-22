@@ -592,7 +592,14 @@ mutation DraftOrderDelete($id: ID!) {
 # Data access
 # ----------------------------
 def build_query() -> str:
-    excluded = " ".join(f"-tag:{tag}" for tag in sorted(EXCLUDE_TAGS) if tag)
+    # Also exclude PROCESSING_TAG from broad fetches so a legitimately in-flight
+    # draft is not repeatedly selected by overlapping scheduled runs. Keep it out
+    # of EXCLUDE_TAGS because claim_draft uses EXCLUDE_TAGS after intentionally
+    # writing PROCESSING_TAG.
+    excluded_tags = set(EXCLUDE_TAGS)
+    if PROCESSING_TAG:
+        excluded_tags.add(PROCESSING_TAG)
+    excluded = " ".join(f"-tag:{tag}" for tag in sorted(excluded_tags) if tag)
     return f"status:open {excluded}".strip()
 
 
@@ -833,6 +840,51 @@ def remove_tags_from_fresh_draft(
     if fresh is None:
         raise RuntimeError(f"{label} failed: draft {draft_id} not found or no longer OPEN")
     return remove_draft_tags(draft_id, fresh.get("tags", []), tags_to_remove, label=label)
+
+
+def cleanup_processing_tag_if_owned(
+    draft_id: str,
+    claim_token: Optional[str],
+    *,
+    label: str = "cleanup processing tag",
+) -> bool:
+    """
+    Remove PROCESSING_TAG only when this run still owns the draft.
+
+    This makes cleanup safe in the face of concurrent runs. If another run has
+    claimed the draft since this run started, its token will differ and this
+    function will refuse to remove the processing tag.
+    """
+    if DRY_RUN:
+        logger.info("DRY RUN | would cleanup PROCESSING_TAG for %s (%s)", draft_id, label)
+        return True
+
+    fresh = fetch_draft_fresh(draft_id)
+    if fresh is None:
+        logger.warning("%s | cleanup skipped | draft not found or no longer OPEN", label)
+        return False
+
+    current_tags = normalize_tags(fresh.get("tags", []))
+    has_processing_tag = PROCESSING_TAG.lower() in {t.lower() for t in current_tags}
+    if not has_processing_tag:
+        logger.info("%s | cleanup skipped | PROCESSING_TAG already absent", label)
+        return True
+
+    current_token = get_metafield_value(fresh, LINEAGE_NAMESPACE, PROCESSING_TOKEN_KEY)
+    if claim_token and current_token != claim_token:
+        logger.warning(
+            "%s | cleanup skipped | ownership token mismatch for %s. "
+            "current_token=%s expected_token=%s",
+            label,
+            draft_id,
+            current_token,
+            claim_token,
+        )
+        return False
+
+    remove_draft_tags(draft_id, current_tags, [PROCESSING_TAG], label=label)
+    logger.info("%s | removed PROCESSING_TAG from %s", label, draft_id)
+    return True
 
 
 def duplicate_draft(parent_id: str) -> Dict[str, Any]:
@@ -1507,6 +1559,7 @@ def claim_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     if DRY_RUN:
+        live["_processing_claim_token"] = claim_token
         return live
 
     verify: Optional[Dict[str, Any]] = None
@@ -1561,6 +1614,7 @@ def claim_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
             )
 
     logger.info("%s | claimed successfully (tag and ownership token verified)", name)
+    verify["_processing_claim_token"] = claim_token
     return verify
 
 def process_draft(draft: Dict[str, Any], availability_by_item: Dict[str, int]) -> None:
@@ -1593,197 +1647,224 @@ def process_draft(draft: Dict[str, Any], availability_by_item: Dict[str, int]) -
         logger.warning("%s | skipped | %s", name, claim_exc)
         return
 
-    # Once claimed, check for an existing child. This ordering matters: doing the
-    # orphan/child search before the lock leaves a race window where two runs can
-    # both find no child and then both duplicate. The unique claim token closes
-    # that window.
-    parent_po = (live_draft.get("poNumber") or "").strip()
-    try:
-        existing_child = find_existing_child_for_parent(live_draft["id"], parent_po)
-    except RuntimeError as search_exc:
-        logger.error(
-            "%s | HALTED | orphan search failed — cannot safely proceed. "
-            "Tagging parent with '%s'. Error: %s",
-            name,
-            NEEDS_REVIEW_TAG,
-            search_exc,
+    claim_token = str(live_draft.get("_processing_claim_token") or "")
+    processing_released = False
+
+    def release_processing(label: str) -> None:
+        nonlocal processing_released
+        if processing_released:
+            return
+        removed = cleanup_processing_tag_if_owned(
+            live_draft["id"],
+            claim_token,
+            label=label,
         )
-        try:
-            remove_tags_from_fresh_draft(live_draft["id"], [PROCESSING_TAG], label="remove processing before needs-review")
-            add_tags_to_fresh_draft(live_draft["id"], [NEEDS_REVIEW_TAG], label="tag needs-review")
-        except Exception as tag_exc:
-            logger.warning("%s | failed to apply needs-review tag: %s", name, tag_exc)
-        return
-
-    if existing_child is not None:
-        logger.error(
-            "%s | HALTED | child draft %s already exists for this parent. "
-            "This likely means a previous run partially succeeded. "
-            "Manually review both drafts before re-running. "
-            "Tagging parent with '%s'.",
-            name,
-            existing_child.get("name") or existing_child.get("id"),
-            NEEDS_REVIEW_TAG,
-        )
-        try:
-            remove_tags_from_fresh_draft(live_draft["id"], [PROCESSING_TAG], label="remove processing before needs-review")
-            add_tags_to_fresh_draft(live_draft["id"], [NEEDS_REVIEW_TAG], label="tag needs-review")
-        except Exception as tag_exc:
-            logger.warning("%s | failed to apply needs-review tag: %s", name, tag_exc)
-        return
-
-    # Use fresh inventory for this claimed draft so the child only contains lines
-    # that can be released now. The broad prefetch is still useful for logging and
-    # as a fallback, but this prevents an old run-level snapshot from driving the
-    # split decision.
-    live_inventory_ids = collect_inventory_ids([live_draft])
-    live_availability = fetch_inventory_availability(live_inventory_ids) if live_inventory_ids else availability_by_item
-
-    eval_data = evaluate_draft(live_draft, live_availability)
-    should_run, reasons = should_split(live_draft, eval_data)
-
-    logger.info(
-        "%s | po=%s | split_depth=%s | ship_date=%s | available_count=%s | remaining_count=%s | available_value=%s | total_value=%s | available_percent=%.2f%%",
-        name,
-        live_draft.get("poNumber") or "",
-        split_depth_from_po(live_draft.get("poNumber") or ""),
-        ship_date_raw,
-        eval_data["available_count"],
-        eval_data["remaining_count"],
-        eval_data["available_value"],
-        eval_data["total_value"],
-        float(eval_data["available_percent"] * Decimal("100")),
-    )
-
-    if not should_run:
-        logger.info("%s | no split | reasons=%s", name, reasons)
-        remove_tags_from_fresh_draft(live_draft["id"], [PROCESSING_TAG], label="remove processing")
-        return
-
-    child_po = build_child_po(live_draft.get("poNumber") or "")
-    logger.info("%s | thresholds passed | child_po=%s", name, child_po)
-
-    child = duplicate_draft(live_draft["id"])
-    logger.info("%s | duplicated -> %s", name, child.get("name") or child.get("id"))
+        processing_released = removed
 
     try:
-        add_draft_tags(child["id"], child.get("tags", []), [PARTIAL_CHILD_TAG], label="stub child tag")
-        logger.info("%s | wrote stub PARTIAL_CHILD_TAG to child %s", name, child.get("id"))
-    except Exception as stub_exc:
-        logger.error(
-            "%s | failed to write stub tag to child %s — rolling back: %s",
-            name,
-            child.get("id"),
-            stub_exc,
-        )
-        delete_draft(child["id"])
+        # Once claimed, check for an existing child. This ordering matters: doing the
+        # orphan/child search before the lock leaves a race window where two runs can
+        # both find no child and then both duplicate. The unique claim token closes
+        # that window.
+        parent_po = (live_draft.get("poNumber") or "").strip()
         try:
-            remove_tags_from_fresh_draft(live_draft["id"], [PROCESSING_TAG], label="remove processing")
-            logger.info("%s | removed PROCESSING_TAG after failed stub tag write", name)
-        except Exception as untag_exc:
+            existing_child = find_existing_child_for_parent(live_draft["id"], parent_po)
+        except RuntimeError as search_exc:
             logger.error(
-                "%s | CRITICAL: could not remove PROCESSING_TAG after stub rollback. "
-                "Draft will be stuck as processing until manually untagged. Error: %s",
+                "%s | HALTED | orphan search failed — cannot safely proceed. "
+                "Tagging parent with '%s'. Error: %s",
                 name,
-                untag_exc,
+                NEEDS_REVIEW_TAG,
+                search_exc,
             )
-        raise
+            try:
+                release_processing("remove processing before needs-review")
+                add_tags_to_fresh_draft(live_draft["id"], [NEEDS_REVIEW_TAG], label="tag needs-review")
+            except Exception as tag_exc:
+                logger.warning("%s | failed to apply needs-review tag: %s", name, tag_exc)
+            return
 
-    child_update = build_child_update_payload(live_draft, eval_data["available_lines"], child_po)
-    try:
-        child = update_draft(child["id"], child_update)
-    except Exception as exc:
-        logger.error(
-            "%s | child update failed — rolling back duplicate %s: %s",
-            name, child.get("id"), exc,
-        )
-        delete_draft(child["id"])
-        try:
-            remove_tags_from_fresh_draft(live_draft["id"], [PROCESSING_TAG], label="remove processing")
-            logger.info("%s | removed PROCESSING_TAG after failed child update", name)
-        except Exception as untag_exc:
+        if existing_child is not None:
             logger.error(
-                "%s | CRITICAL: could not remove PROCESSING_TAG after rollback. "
-                "Draft will be stuck as processing until manually untagged. Error: %s",
-                name, untag_exc,
-            )
-        raise
-
-    logger.info(
-        "%s | child updated -> %s (%s)",
-        name,
-        child.get("name") or child.get("id"),
-        child.get("poNumber") or child_po,
-    )
-
-    parent_input = build_parent_update_payload(live_draft, eval_data["remaining_lines"])
-    try:
-        parent_after_update = update_draft(live_draft["id"], parent_input)
-        add_tags_to_fresh_draft(live_draft["id"], [PARTIAL_PARENT_TAG], label="tag parent done")
-        remove_tags_from_fresh_draft(live_draft["id"], [PROCESSING_TAG], label="remove processing after parent update")
-        parent_after_update = fetch_draft_fresh(live_draft["id"]) or parent_after_update
-        logger.info("%s | parent updated with remaining lines and tagged %s", name, PARTIAL_PARENT_TAG)
-    except Exception as exc:
-        logger.error(
-            "%s | parent update failed after child %s was created — rolling back child: %s",
-            name,
-            child.get("id"),
-            exc,
-        )
-        delete_draft(child["id"])
-        try:
-            remove_tags_from_fresh_draft(live_draft["id"], [PROCESSING_TAG], label="remove processing")
-        except Exception as untag_exc:
-            logger.error(
-                "%s | CRITICAL: could not remove PROCESSING_TAG after parent-update rollback. Error: %s",
+                "%s | HALTED | child draft %s already exists for this parent. "
+                "This likely means a previous run partially succeeded. "
+                "Manually review both drafts before re-running. "
+                "Tagging parent with '%s'.",
                 name,
-                untag_exc,
-            )
-        raise
-
-    if not DRY_RUN:
-        refreshed_parent = fetch_draft_fresh(live_draft["id"]) or parent_after_update
-        refreshed_child = fetch_draft_fresh(child["id"]) or child
-        reconciled, reconciliation_reasons = verify_split_reconciliation(
-            live_draft,
-            refreshed_parent,
-            refreshed_child,
-        )
-        if not reconciled:
-            logger.error(
-                "%s | RECONCILIATION FAILED | %s | tagging parent and child with %s",
-                name,
-                reconciliation_reasons,
+                existing_child.get("name") or existing_child.get("id"),
                 NEEDS_REVIEW_TAG,
             )
             try:
-                remove_tags_from_fresh_draft(refreshed_parent["id"], [PROCESSING_TAG, READY_TAG], label="reconciliation parent remove unsafe tags")
-                add_tags_to_fresh_draft(refreshed_parent["id"], [NEEDS_REVIEW_TAG], label="reconciliation parent needs-review")
+                release_processing("remove processing before needs-review")
+                add_tags_to_fresh_draft(live_draft["id"], [NEEDS_REVIEW_TAG], label="tag needs-review")
             except Exception as tag_exc:
-                logger.error("%s | failed to tag parent after reconciliation failure: %s", name, tag_exc)
-            try:
-                remove_tags_from_fresh_draft(refreshed_child["id"], [READY_TAG], label="reconciliation child remove ready")
-                add_tags_to_fresh_draft(refreshed_child["id"], [NEEDS_REVIEW_TAG], label="reconciliation child needs-review")
-            except Exception as tag_exc:
-                logger.error("%s | failed to tag child after reconciliation failure: %s", name, tag_exc)
-            raise RuntimeError(f"{name} | reconciliation failed | {reconciliation_reasons}")
+                logger.warning("%s | failed to apply needs-review tag: %s", name, tag_exc)
+            return
+
+        # Use fresh inventory for this claimed draft so the child only contains lines
+        # that can be released now. The broad prefetch is still useful for logging and
+        # as a fallback, but this prevents an old run-level snapshot from driving the
+        # split decision.
+        live_inventory_ids = collect_inventory_ids([live_draft])
+        live_availability = fetch_inventory_availability(live_inventory_ids) if live_inventory_ids else availability_by_item
+
+        eval_data = evaluate_draft(live_draft, live_availability)
+        should_run, reasons = should_split(live_draft, eval_data)
 
         logger.info(
-            "%s | reconciliation passed | original_total=%s parent_total=%s child_total=%s combined_total=%s",
+            "%s | po=%s | split_depth=%s | ship_date=%s | available_count=%s | remaining_count=%s | available_value=%s | total_value=%s | available_percent=%.2f%%",
             name,
-            calculate_draft_line_value(live_draft),
-            calculate_draft_line_value(refreshed_parent),
-            calculate_draft_line_value(refreshed_child),
-            calculate_draft_line_value(refreshed_parent) + calculate_draft_line_value(refreshed_child),
+            live_draft.get("poNumber") or "",
+            split_depth_from_po(live_draft.get("poNumber") or ""),
+            ship_date_raw,
+            eval_data["available_count"],
+            eval_data["remaining_count"],
+            eval_data["available_value"],
+            eval_data["total_value"],
+            float(eval_data["available_percent"] * Decimal("100")),
         )
 
-    append_split_log_row(
-        parent=live_draft,
-        child=child,
-        eval_data=eval_data,
-        ship_date=ship_date_raw,
-        child_po=child_po,
-    )
+        if not should_run:
+            logger.info("%s | no split | reasons=%s", name, reasons)
+            release_processing("remove processing")
+            return
+
+        child_po = build_child_po(live_draft.get("poNumber") or "")
+        logger.info("%s | thresholds passed | child_po=%s", name, child_po)
+
+        child = duplicate_draft(live_draft["id"])
+        logger.info("%s | duplicated -> %s", name, child.get("name") or child.get("id"))
+
+        try:
+            add_draft_tags(child["id"], child.get("tags", []), [PARTIAL_CHILD_TAG], label="stub child tag")
+            logger.info("%s | wrote stub PARTIAL_CHILD_TAG to child %s", name, child.get("id"))
+        except Exception as stub_exc:
+            logger.error(
+                "%s | failed to write stub tag to child %s — rolling back: %s",
+                name,
+                child.get("id"),
+                stub_exc,
+            )
+            delete_draft(child["id"])
+            try:
+                release_processing("remove processing after failed stub tag write")
+                logger.info("%s | removed PROCESSING_TAG after failed stub tag write", name)
+            except Exception as untag_exc:
+                logger.error(
+                    "%s | CRITICAL: could not remove PROCESSING_TAG after stub rollback. "
+                    "Draft will be stuck as processing until manually untagged. Error: %s",
+                    name,
+                    untag_exc,
+                )
+            raise
+
+        child_update = build_child_update_payload(live_draft, eval_data["available_lines"], child_po)
+        try:
+            child = update_draft(child["id"], child_update)
+        except Exception as exc:
+            logger.error(
+                "%s | child update failed — rolling back duplicate %s: %s",
+                name, child.get("id"), exc,
+            )
+            delete_draft(child["id"])
+            try:
+                release_processing("remove processing after failed child update")
+                logger.info("%s | removed PROCESSING_TAG after failed child update", name)
+            except Exception as untag_exc:
+                logger.error(
+                    "%s | CRITICAL: could not remove PROCESSING_TAG after rollback. "
+                    "Draft will be stuck as processing until manually untagged. Error: %s",
+                    name, untag_exc,
+                )
+            raise
+
+        logger.info(
+            "%s | child updated -> %s (%s)",
+            name,
+            child.get("name") or child.get("id"),
+            child.get("poNumber") or child_po,
+        )
+
+        parent_input = build_parent_update_payload(live_draft, eval_data["remaining_lines"])
+        try:
+            parent_after_update = update_draft(live_draft["id"], parent_input)
+            add_tags_to_fresh_draft(live_draft["id"], [PARTIAL_PARENT_TAG], label="tag parent done")
+            release_processing("remove processing after parent update")
+            parent_after_update = fetch_draft_fresh(live_draft["id"]) or parent_after_update
+            logger.info("%s | parent updated with remaining lines and tagged %s", name, PARTIAL_PARENT_TAG)
+        except Exception as exc:
+            logger.error(
+                "%s | parent update failed after child %s was created — rolling back child: %s",
+                name,
+                child.get("id"),
+                exc,
+            )
+            delete_draft(child["id"])
+            try:
+                release_processing("remove processing after parent-update rollback")
+            except Exception as untag_exc:
+                logger.error(
+                    "%s | CRITICAL: could not remove PROCESSING_TAG after parent-update rollback. Error: %s",
+                    name,
+                    untag_exc,
+                )
+            raise
+
+        if not DRY_RUN:
+            refreshed_parent = fetch_draft_fresh(live_draft["id"]) or parent_after_update
+            refreshed_child = fetch_draft_fresh(child["id"]) or child
+            reconciled, reconciliation_reasons = verify_split_reconciliation(
+                live_draft,
+                refreshed_parent,
+                refreshed_child,
+            )
+            if not reconciled:
+                logger.error(
+                    "%s | RECONCILIATION FAILED | %s | tagging parent and child with %s",
+                    name,
+                    reconciliation_reasons,
+                    NEEDS_REVIEW_TAG,
+                )
+                try:
+                    remove_tags_from_fresh_draft(refreshed_parent["id"], [PROCESSING_TAG, READY_TAG], label="reconciliation parent remove unsafe tags")
+                    add_tags_to_fresh_draft(refreshed_parent["id"], [NEEDS_REVIEW_TAG], label="reconciliation parent needs-review")
+                    processing_released = True
+                except Exception as tag_exc:
+                    logger.error("%s | failed to tag parent after reconciliation failure: %s", name, tag_exc)
+                try:
+                    remove_tags_from_fresh_draft(refreshed_child["id"], [READY_TAG], label="reconciliation child remove ready")
+                    add_tags_to_fresh_draft(refreshed_child["id"], [NEEDS_REVIEW_TAG], label="reconciliation child needs-review")
+                except Exception as tag_exc:
+                    logger.error("%s | failed to tag child after reconciliation failure: %s", name, tag_exc)
+                raise RuntimeError(f"{name} | reconciliation failed | {reconciliation_reasons}")
+
+            logger.info(
+                "%s | reconciliation passed | original_total=%s parent_total=%s child_total=%s combined_total=%s",
+                name,
+                calculate_draft_line_value(live_draft),
+                calculate_draft_line_value(refreshed_parent),
+                calculate_draft_line_value(refreshed_child),
+                calculate_draft_line_value(refreshed_parent) + calculate_draft_line_value(refreshed_child),
+            )
+
+        append_split_log_row(
+            parent=live_draft,
+            child=child,
+            eval_data=eval_data,
+            ship_date=ship_date_raw,
+            child_po=child_po,
+        )
+    finally:
+        if claim_token and not processing_released:
+            try:
+                release_processing("final safety cleanup")
+            except Exception as cleanup_exc:
+                logger.error(
+                    "%s | CRITICAL: final safety cleanup failed. "
+                    "PROCESSING_TAG may remain and requires manual review. Error: %s",
+                    name,
+                    cleanup_exc,
+                )
 
 def collect_inventory_ids(drafts: List[Dict[str, Any]]) -> List[str]:
     ids: List[str] = []
