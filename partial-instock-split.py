@@ -1101,7 +1101,13 @@ def build_child_metafields(parent: Dict[str, Any], child_po: str) -> List[Dict[s
         if not namespace or not key or not mf_type or value is None:
             continue
 
-        if namespace == LINEAGE_NAMESPACE and key.startswith("partial_split_"):
+        # Do not copy split lineage fields or the transient processing ownership
+        # token from the parent onto the child. The child gets fresh lineage below,
+        # and it should never inherit the parent claim token.
+        if namespace == LINEAGE_NAMESPACE and (
+            key.startswith("partial_split_")
+            or key == PROCESSING_TOKEN_KEY
+        ):
             continue
 
         existing.append(
@@ -1736,8 +1742,34 @@ def process_draft(draft: Dict[str, Any], availability_by_item: Dict[str, int]) -
         logger.info("%s | duplicated -> %s", name, child.get("name") or child.get("id"))
 
         try:
-            add_draft_tags(child["id"], child.get("tags", []), [PARTIAL_CHILD_TAG], label="stub child tag")
-            logger.info("%s | wrote stub PARTIAL_CHILD_TAG to child %s", name, child.get("id"))
+            # Shopify duplicates the claimed parent wholesale, including tags.
+            # The parent has PROCESSING_TAG at this point, so the child would
+            # inherit it unless we explicitly remove it on the first child tag
+            # write. Also strip other workflow terminal/review tags that should
+            # not carry over to a new child draft.
+            child_stub_tags = add_tags(
+                remove_tags(
+                    child.get("tags", []),
+                    PROCESSING_TAG,
+                    PARTIAL_PARENT_TAG,
+                    READY_TAG,
+                    NEEDS_REVIEW_TAG,
+                    SUBMITTED_TAG,
+                ),
+                PARTIAL_CHILD_TAG,
+            )
+
+            update_draft_tags_full(
+                child["id"],
+                child_stub_tags,
+                label="stub child tag and remove inherited workflow tags",
+            )
+
+            logger.info(
+                "%s | wrote PARTIAL_CHILD_TAG and removed inherited workflow tags from child %s",
+                name,
+                child.get("id"),
+            )
         except Exception as stub_exc:
             logger.error(
                 "%s | failed to write stub tag to child %s — rolling back: %s",
