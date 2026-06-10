@@ -3,7 +3,13 @@ name: Partial In-Stock Split
 on:
   workflow_dispatch:
   schedule:
-    - cron: "15 12-21/4 * * 1-5"
+    # 10:15 PM Eastern during daylight saving time = 2:15 AM UTC next day
+    # Runs Sunday-Thursday night Eastern, represented as Monday-Friday UTC
+    - cron: "15 2 * * 1-5"
+
+concurrency:
+  group: partial-instock-split
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -15,6 +21,8 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -73,14 +81,24 @@ jobs:
       - name: Upload CSV log artifact
         uses: actions/upload-artifact@v4
         with:
-          name: partial-instock-split-log
+          name: partial-instock-split-log-${{ github.run_id }}
           path: logs/partial_instock_split_history.csv
           if-no-files-found: ignore
+          retention-days: 30
 
       - name: Commit updated CSV log
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
           git add logs/partial_instock_split_history.csv
-          git diff --cached --quiet || git commit -m "Update partial instock split log"
-          git push
+
+          if git diff --cached --quiet; then
+            echo "No CSV log changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Update partial instock split log"
+
+          git pull --rebase origin main
+          git push origin main
