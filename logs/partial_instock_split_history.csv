@@ -2651,3 +2651,4 @@ timestamp_utc,parent_draft_id,parent_draft_name,parent_po,child_draft_id,child_d
 2026-08-11T05:15:21+00:00,gid://shopify/DraftOrder/1538745860462,#D32081,RK8617600,gid://shopify/DraftOrder/1539764748654,#D32826,RK8617600-BO,2026-08-17,7,3,1170.0,2016.0,58.04,0,1,partial_instock_split,false
 2026-08-12T05:33:35+00:00,gid://shopify/DraftOrder/1537509196142,#D30739,OM5718983,gid://shopify/DraftOrder/1539913515374,#D32913,OM5718983-BO,2026-07-21,12,1,256.0,256.0,100.00,0,1,partial_instock_split,false
 2026-08-12T05:37:56+00:00,gid://shopify/DraftOrder/1538109374830,#D31142,KS1244367,gid://shopify/DraftOrder/1539913941358,#D32914,KS1244367-BO,2026-08-15,14,1,720.0,720.0,100.00,0,1,partial_instock_split,false
+2026-08-13T05:56:51+00:00,gid://shopify/DraftOrder/1539266576750,#D32660,AB3316261 -maj/clickwick/fall harv,gid://shopify/DraftOrder/1540098654574,#D33030,AB3316261 -maj/clickwick/fall harv-BO,2026-08-02,1,6,104.0,384.0,27.08,0,1,partial_instock_split,false
