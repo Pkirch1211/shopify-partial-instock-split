@@ -1,0 +1,97 @@
+name: Partial Instock Split (Nightly)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 8 * * *"
+
+jobs:
+  run-partial-split:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Debug env presence
+        shell: bash
+        env:
+          SHOPIFY_ADMIN_ACCESS_TOKEN: ${{ secrets.SHOPIFY_ADMIN_ACCESS_TOKEN }}
+          SHOPIFY_SHOP: ${{ secrets.SHOPIFY_SHOP }}
+          SHOPIFY_LOCATION_ID: ${{ secrets.SHOPIFY_LOCATION_ID }}
+          DRY_RUN: ${{ vars.DRY_RUN }}
+          MIN_SPLIT_VALUE: ${{ vars.MIN_SPLIT_VALUE }}
+          MIN_BACKORDER_HOLD_VALUE: ${{ vars.MIN_BACKORDER_HOLD_VALUE }}
+          SPLIT_150_TAG: ${{ vars.SPLIT_150_TAG }}
+          BO_PROCESSING_TAG: ${{ vars.BO_PROCESSING_TAG }}
+        run: |
+          echo "SHOPIFY_ADMIN_ACCESS_TOKEN set? -> $([[ -n "$SHOPIFY_ADMIN_ACCESS_TOKEN" ]] && echo YES || echo NO)"
+          echo "SHOPIFY_SHOP set? -> $([[ -n "$SHOPIFY_SHOP" ]] && echo YES || echo NO)"
+          echo "SHOPIFY_LOCATION_ID set? -> $([[ -n "$SHOPIFY_LOCATION_ID" ]] && echo YES || echo NO)"
+          echo "DRY_RUN -> ${DRY_RUN:-MISSING}"
+          echo "MIN_SPLIT_VALUE -> ${MIN_SPLIT_VALUE:-MISSING}"
+          echo "MIN_BACKORDER_HOLD_VALUE -> ${MIN_BACKORDER_HOLD_VALUE:-MISSING}"
+          echo "SPLIT_150_TAG -> ${SPLIT_150_TAG:-MISSING}"
+          echo "BO_PROCESSING_TAG -> ${BO_PROCESSING_TAG:-MISSING}"
+
+      - name: Run nightly partial-instock split
+        env:
+          SHOPIFY_ADMIN_ACCESS_TOKEN: ${{ secrets.SHOPIFY_ADMIN_ACCESS_TOKEN }}
+          SHOPIFY_SHOP: ${{ secrets.SHOPIFY_SHOP }}
+          SHOPIFY_LOCATION_ID: ${{ secrets.SHOPIFY_LOCATION_ID }}
+
+          SHOPIFY_API_VERSION: ${{ vars.SHOPIFY_API_VERSION }}
+          DRY_RUN: ${{ vars.DRY_RUN }}
+          LOG_LEVEL: ${{ vars.LOG_LEVEL }}
+          MAX_DRAFTS: ${{ vars.MAX_DRAFTS }}
+
+          # Deliberately NOT mapping DRAFT_ORDER_NAMES here -- see note above.
+
+          # --- dual-gate thresholds (keep in sync with shopify-adjust-orders-v2.py's repo) ---
+          MIN_SPLIT_VALUE: ${{ vars.MIN_SPLIT_VALUE }}
+          MIN_BACKORDER_HOLD_VALUE: ${{ vars.MIN_BACKORDER_HOLD_VALUE }}
+
+          # --- value-band tags (SPLIT_150_TAG also drives this script's entire query pool) ---
+          SPLIT_150_TAG: ${{ vars.SPLIT_150_TAG }}
+          SPLIT_REMAINDER_TAG: ${{ vars.SPLIT_REMAINDER_TAG }}
+
+          # --- this script's own concurrency lock, separate from v2-processing ---
+          BO_PROCESSING_TAG: ${{ vars.BO_PROCESSING_TAG }}
+
+          NEEDS_REVIEW_TAG: ${{ vars.NEEDS_REVIEW_TAG }}
+          LAUNCH_TAG_PREFIX: ${{ vars.LAUNCH_TAG_PREFIX }}
+          CONVERSION_TRIGGER_TAGS: ${{ vars.CONVERSION_TRIGGER_TAGS }}
+
+          EXCLUDED_CUSTOMERS: ${{ vars.EXCLUDED_CUSTOMERS }}
+          EXCLUDED_CUSTOMER_SUBSTRINGS: ${{ vars.EXCLUDED_CUSTOMER_SUBSTRINGS }}
+
+          # --- linking fields: MUST match whatever shopify-adjust-orders-v2.py's repo
+          # actually uses, since this script reads metafields that repo wrote ---
+          LINK_CUSTOM_ATTR_PO_KEY: ${{ vars.LINK_CUSTOM_ATTR_PO_KEY }}
+          LINK_CUSTOM_ATTR_DRAFTID_KEY: ${{ vars.LINK_CUSTOM_ATTR_DRAFTID_KEY }}
+
+          PO_METAFIELD_NAMESPACE: ${{ vars.PO_METAFIELD_NAMESPACE }}
+          PO_METAFIELD_KEY: ${{ vars.PO_METAFIELD_KEY }}
+          PO_METAFIELD_TYPE: ${{ vars.PO_METAFIELD_TYPE }}
+
+          ORIGINAL_DRAFT_ID_METAFIELD_NAMESPACE: ${{ vars.ORIGINAL_DRAFT_ID_METAFIELD_NAMESPACE }}
+          ORIGINAL_DRAFT_ID_METAFIELD_KEY: ${{ vars.ORIGINAL_DRAFT_ID_METAFIELD_KEY }}
+          ORIGINAL_DRAFT_ID_METAFIELD_TYPE: ${{ vars.ORIGINAL_DRAFT_ID_METAFIELD_TYPE }}
+
+          SHIP_DATE_METAFIELD_NAMESPACE: ${{ vars.SHIP_DATE_METAFIELD_NAMESPACE }}
+          SHIP_DATE_METAFIELD_KEY: ${{ vars.SHIP_DATE_METAFIELD_KEY }}
+          SHIP_DATE_WINDOW_DAYS: ${{ vars.SHIP_DATE_WINDOW_DAYS }}
+
+        run: |
+          python partial-instock-split-2.py
