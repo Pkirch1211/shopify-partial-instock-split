@@ -32,6 +32,7 @@ jobs:
           SHOPIFY_LOCATION_ID: ${{ secrets.SHOPIFY_LOCATION_ID }}
           DRY_RUN: ${{ vars.DRY_RUN }}
           MIN_SPLIT_VALUE: ${{ vars.MIN_SPLIT_VALUE }}
+          MIN_SPLIT_VALUE_REMAINDER: ${{ vars.MIN_SPLIT_VALUE_REMAINDER }}
           MIN_BACKORDER_HOLD_VALUE: ${{ vars.MIN_BACKORDER_HOLD_VALUE }}
           SPLIT_150_TAG: ${{ vars.SPLIT_150_TAG }}
           BO_PROCESSING_TAG: ${{ vars.BO_PROCESSING_TAG }}
@@ -41,6 +42,7 @@ jobs:
           echo "SHOPIFY_LOCATION_ID set? -> $([[ -n "$SHOPIFY_LOCATION_ID" ]] && echo YES || echo NO)"
           echo "DRY_RUN -> ${DRY_RUN:-MISSING}"
           echo "MIN_SPLIT_VALUE -> ${MIN_SPLIT_VALUE:-MISSING}"
+          echo "MIN_SPLIT_VALUE_REMAINDER -> ${MIN_SPLIT_VALUE_REMAINDER:-MISSING}"
           echo "MIN_BACKORDER_HOLD_VALUE -> ${MIN_BACKORDER_HOLD_VALUE:-MISSING}"
           echo "SPLIT_150_TAG -> ${SPLIT_150_TAG:-MISSING}"
           echo "BO_PROCESSING_TAG -> ${BO_PROCESSING_TAG:-MISSING}"
@@ -58,11 +60,12 @@ jobs:
 
           # Deliberately NOT mapping DRAFT_ORDER_NAMES here -- see note above.
 
-          # --- dual-gate thresholds (keep in sync with shopify-adjust-orders-v2.py's repo) ---
+          # --- gate thresholds ---
           MIN_SPLIT_VALUE: ${{ vars.MIN_SPLIT_VALUE }}
+          MIN_SPLIT_VALUE_REMAINDER: ${{ vars.MIN_SPLIT_VALUE_REMAINDER }}
           MIN_BACKORDER_HOLD_VALUE: ${{ vars.MIN_BACKORDER_HOLD_VALUE }}
 
-          # --- value-band tags (SPLIT_150_TAG also drives this script's entire query pool) ---
+          # --- value-band tags (SPLIT_150_TAG and SPLIT_REMAINDER_TAG together drive this script's entire query pool) ---
           SPLIT_150_TAG: ${{ vars.SPLIT_150_TAG }}
           SPLIT_REMAINDER_TAG: ${{ vars.SPLIT_REMAINDER_TAG }}
 
