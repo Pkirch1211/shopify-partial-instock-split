@@ -118,15 +118,21 @@ LOG_LEVEL = (env_first("LOG_LEVEL", default="INFO") or "INFO").upper()
 # Same knobs as shopify-adjust-orders-v2.py, intentionally the same env var
 # names so a single GitHub repo-variable change updates both scripts at once.
 MIN_SPLIT_VALUE = env_decimal("MIN_SPLIT_VALUE", default="150")
+# Keep-side bar for a draft already tagged split-remainder (i.e. its own
+# total was already under MIN_SPLIT_VALUE at creation). Distinct from
+# MIN_BACKORDER_HOLD_VALUE below even though it defaults to the same $75 --
+# one gates the keep side for a low-value band, the other gates the
+# backorder side for every band. Tuned independently.
+MIN_SPLIT_VALUE_REMAINDER = env_decimal("MIN_SPLIT_VALUE_REMAINDER", default="75")
 MIN_BACKORDER_HOLD_VALUE = env_decimal("MIN_BACKORDER_HOLD_VALUE", default="75")
 
-# Value-band tags. SPLIT_150_TAG doubles as this script's ENTIRE query
-# filter (see build_open_ended_query) -- any backorder-descended draft,
-# regardless of generation, gets exactly one of these two tags once at
-# creation and it is never touched again. split-remainder drafts are
-# excluded from this pipeline for good the moment they're created: a
-# draft whose own total is already under MIN_SPLIT_VALUE can never
-# produce a keep-side that clears the gate on a further split.
+# Value-band tags. Both SPLIT_150_TAG and SPLIT_REMAINDER_TAG feed this
+# script's query pool (see build_open_ended_query) -- any backorder-descended
+# draft, regardless of generation, gets exactly one of these two tags once at
+# creation and it is never touched again. split-remainder drafts are NOT
+# excluded from this pipeline: they're still evaluated every run, just against
+# a lower keep-side bar (MIN_SPLIT_VALUE_REMAINDER) since their own total was
+# already under MIN_SPLIT_VALUE at creation.
 SPLIT_REMAINDER_TAG = env_first("SPLIT_REMAINDER_TAG", default="split-remainder") or "split-remainder"
 SPLIT_150_TAG = env_first("SPLIT_150_TAG", default="split-150") or "split-150"
 
@@ -226,7 +232,8 @@ SHIP_DATE_WINDOW_DAYS = env_int("SHIP_DATE_WINDOW_DAYS", default=7)
 print("SHOPIFY_SHOP =", SHOP)
 print("API_VERSION  =", API_VERSION)
 print("DRY_RUN =", DRY_RUN)
-print("MIN_SPLIT_VALUE (keep-side gate) =", MIN_SPLIT_VALUE)
+print("MIN_SPLIT_VALUE (keep-side gate, split-150) =", MIN_SPLIT_VALUE)
+print("MIN_SPLIT_VALUE_REMAINDER (keep-side gate, split-remainder) =", MIN_SPLIT_VALUE_REMAINDER)
 print("MIN_BACKORDER_HOLD_VALUE (backorder hold gate) =", MIN_BACKORDER_HOLD_VALUE)
 print("SPLIT_150_TAG (also = query pool filter) =", SPLIT_150_TAG)
 print("SPLIT_REMAINDER_TAG =", SPLIT_REMAINDER_TAG)
@@ -683,6 +690,16 @@ def pick_split_band_tag(bo_value: Decimal) -> str:
     return SPLIT_REMAINDER_TAG
 
 
+def required_keep_value(tags: List[str]) -> Decimal:
+    # split-150 drafts must clear the full keep-side bar. split-remainder
+    # drafts (already below MIN_SPLIT_VALUE at creation) get the lower
+    # MIN_SPLIT_VALUE_REMAINDER bar instead, so a smaller in-stock/
+    # non-embargo portion can still release.
+    if SPLIT_REMAINDER_TAG in (tags or []):
+        return MIN_SPLIT_VALUE_REMAINDER
+    return MIN_SPLIT_VALUE
+
+
 # ----------------------------
 # MUTATION WRAPPERS (identical to v2)
 # ----------------------------
@@ -790,8 +807,8 @@ def process_draft(draft_id: str) -> str:
 
     # Defensive re-check even though the query already filters on this --
     # belt and suspenders, same philosophy as v2's allow-list check.
-    if SPLIT_150_TAG not in existing_tags:
-        logger.info("%s: SKIP (missing '%s' tag).", name, SPLIT_150_TAG)
+    if SPLIT_150_TAG not in existing_tags and SPLIT_REMAINDER_TAG not in existing_tags:
+        logger.info("%s: SKIP (missing '%s'/'%s' tag).", name, SPLIT_150_TAG, SPLIT_REMAINDER_TAG)
         return "skipped"
     if NEEDS_REVIEW_TAG in existing_tags:
         logger.info("%s: SKIP (tag '%s' present).", name, NEEDS_REVIEW_TAG)
@@ -831,14 +848,15 @@ def process_draft(draft_id: str) -> str:
             processing_released = True
             return "resolved"
 
+        keep_threshold = required_keep_value(original_tags)
         keep_value = sum_value(keep_lines)
         bo_value = sum_value(backorder_lines)
-        keep_ok = keep_value >= MIN_SPLIT_VALUE
+        keep_ok = keep_value >= keep_threshold
         bo_hold_ok = bo_value >= MIN_BACKORDER_HOLD_VALUE
 
         logger.info(
             "%s: projected keep=%s (ok=%s @ $%s) backorder=%s (hold_ok=%s @ $%s)",
-            name, keep_value, keep_ok, MIN_SPLIT_VALUE, bo_value, bo_hold_ok, MIN_BACKORDER_HOLD_VALUE,
+            name, keep_value, keep_ok, keep_threshold, bo_value, bo_hold_ok, MIN_BACKORDER_HOLD_VALUE,
         )
 
         # CASE 1: nothing clears the gate yet. No-op, no tag change, try
@@ -910,7 +928,7 @@ def process_draft(draft_id: str) -> str:
             refreshed_child = fetch_draft_detail(child["id"])
             actual_keep_value = sum_value((refreshed_parent.get("lineItems") or {}).get("nodes") or [])
             actual_bo_value = sum_value((refreshed_child.get("lineItems") or {}).get("nodes") or [])
-            actual_keep_ok = actual_keep_value >= MIN_SPLIT_VALUE
+            actual_keep_ok = actual_keep_value >= keep_threshold
             actual_bo_hold_ok = actual_bo_value >= MIN_BACKORDER_HOLD_VALUE
             logger.info(
                 "%s: actual keep=%s (ok=%s) backorder=%s (hold_ok=%s)",
@@ -954,14 +972,15 @@ def chunk_list(items: List[str], size: int) -> List[List[str]]:
 
 
 def build_open_ended_query() -> str:
-    # The ENTIRE pool for this script: open drafts tagged with the $150+
-    # value band, minus needs-review and minus anything currently locked by
-    # a concurrent run. Deliberately NO generation-tag enumeration and NO
-    # "already evaluated" exclusion -- every eligible draft gets walked
-    # every run, forever, per the no-shortcut-exclusion principle.
+    # The ENTIRE pool for this script: open drafts tagged with either value
+    # band (split-150 or split-remainder), minus needs-review and minus
+    # anything currently locked by a concurrent run. Deliberately NO
+    # generation-tag enumeration and NO "already evaluated" exclusion --
+    # every eligible draft gets walked every run, forever, per the
+    # no-shortcut-exclusion principle.
     parts = [
         "status:open",
-        f"tag:{SPLIT_150_TAG}",
+        f"(tag:{SPLIT_150_TAG} OR tag:{SPLIT_REMAINDER_TAG})",
         f"-tag:{NEEDS_REVIEW_TAG}",
         f"-tag:{PROCESSING_TAG}",
     ]
@@ -976,8 +995,9 @@ def main() -> None:
     if DRAFT_ORDER_NAMES:
         for chunk in chunk_list(DRAFT_ORDER_NAMES, 12):
             name_query = build_draft_name_query(chunk)
-            # Even in scoped test mode, still require the split-150 tag.
-            query = f"status:open tag:{SPLIT_150_TAG} ({name_query})" if name_query else f"status:open tag:{SPLIT_150_TAG}"
+            # Even in scoped test mode, still require one of the value-band tags.
+            band_clause = f"(tag:{SPLIT_150_TAG} OR tag:{SPLIT_REMAINDER_TAG})"
+            query = f"status:open {band_clause} ({name_query})" if name_query else f"status:open {band_clause}"
             after = None
             while True:
                 resp = gql(QUERY_DRAFTS, {"first": 250, "after": after, "query": query}).get("draftOrders") or {}
