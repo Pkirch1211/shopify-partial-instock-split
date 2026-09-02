@@ -136,6 +136,15 @@ MIN_BACKORDER_HOLD_VALUE = env_decimal("MIN_BACKORDER_HOLD_VALUE", default="75")
 SPLIT_REMAINDER_TAG = env_first("SPLIT_REMAINDER_TAG", default="split-remainder") or "split-remainder"
 SPLIT_150_TAG = env_first("SPLIT_150_TAG", default="split-150") or "split-150"
 
+# Identity/allow-list tag stamped once by shopify-orders-all-open.py on every
+# NEW draft at creation. It marks "this is an original split0 PO" and is
+# permanent for that lineage's root -- but it must NEVER be inherited by a
+# backorder child produced here, or the child ends up structurally
+# indistinguishable from a brand-new split0 draft (and gets re-picked up by
+# the initial splitter's allow-list). Stripped explicitly below alongside the
+# parent's own generation tag.
+SPLIT0_TAG = env_first("SPLIT0_TAG", default="split0") or "split0"
+
 LAUNCH_TAG_PREFIX = (env_first("LAUNCH_TAG_PREFIX", default="launch-") or "launch-").casefold()
 
 # This script's own concurrency lock. Deliberately separate from v2-processing
@@ -237,6 +246,7 @@ print("MIN_SPLIT_VALUE_REMAINDER (keep-side gate, split-remainder) =", MIN_SPLIT
 print("MIN_BACKORDER_HOLD_VALUE (backorder hold gate) =", MIN_BACKORDER_HOLD_VALUE)
 print("SPLIT_150_TAG (also = query pool filter) =", SPLIT_150_TAG)
 print("SPLIT_REMAINDER_TAG =", SPLIT_REMAINDER_TAG)
+print("SPLIT0_TAG (stripped from children) =", SPLIT0_TAG)
 print("LAUNCH_TAG_PREFIX =", LAUNCH_TAG_PREFIX)
 print("PROCESSING_TAG =", PROCESSING_TAG)
 print("NEEDS_REVIEW_TAG =", NEEDS_REVIEW_TAG)
@@ -887,13 +897,17 @@ def process_draft(draft_id: str) -> str:
         try:
             ca_add, mf_add = build_linking_fields(root_po=root_po, root_draft_id=root_draft_id, own_new_po=own_new_po)
             # Child inherits parent's tags MINUS: parent's own generation tag
-            # (child gets its own), conversion-trigger tags, and the
-            # processing lock -- then gains its own generation tag. The
+            # (child gets its own), conversion-trigger tags, the processing
+            # lock, and the split0 identity/allow-list tag (a backorder
+            # child must never look like a fresh split0 draft to the
+            # initial splitter) -- then gains its own generation tag. The
             # value-band tag (split-150/split-remainder) is deliberately
             # NOT set yet -- that only happens after verification, below.
             child_base_tags = without_tags(
                 list(original_tags),
-                CONVERSION_TRIGGER_TAGS.union({PROCESSING_TAG, generation_tag_for(parent_generation)}),
+                CONVERSION_TRIGGER_TAGS.union(
+                    {PROCESSING_TAG, SPLIT0_TAG, generation_tag_for(parent_generation)}
+                ),
             )
             child_input = {
                 "lineItems": [build_line_input(l) for l in backorder_lines],
@@ -906,7 +920,7 @@ def process_draft(draft_id: str) -> str:
 
             # Parent keeps ONLY the newly-shippable lines and releases the
             # lock in the same call. Every other tag (including its own
-            # generation tag and value-band tag) is left completely
+            # generation tag, split0, and value-band tag) is left completely
             # untouched, per design.
             parent_input = {
                 "lineItems": [build_line_input(l) for l in keep_lines],
