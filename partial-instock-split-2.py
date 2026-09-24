@@ -119,12 +119,13 @@ LOG_LEVEL = (env_first("LOG_LEVEL", default="INFO") or "INFO").upper()
 # names so a single GitHub repo-variable change updates both scripts at once.
 MIN_SPLIT_VALUE = env_decimal("MIN_SPLIT_VALUE", default="150")
 # Keep-side bar for a draft already tagged split-remainder (i.e. its own
-# total was already under MIN_SPLIT_VALUE at creation). Distinct from
-# MIN_BACKORDER_HOLD_VALUE below even though it defaults to the same $75 --
-# one gates the keep side for a low-value band, the other gates the
-# backorder side for every band. Tuned independently.
+# total was already under MIN_SPLIT_VALUE at creation).
 MIN_SPLIT_VALUE_REMAINDER = env_decimal("MIN_SPLIT_VALUE_REMAINDER", default="75")
-MIN_BACKORDER_HOLD_VALUE = env_decimal("MIN_BACKORDER_HOLD_VALUE", default="75")
+
+# REMOVED 2026-09-24: MIN_BACKORDER_HOLD_VALUE (backorder hold gate). The only
+# gate is now the KEEP side -- is there enough releasable product? The value
+# of the backorder child created is irrelevant; a split creates another BO
+# child regardless of its $ amount.
 
 # Value-band tags. Both SPLIT_150_TAG and SPLIT_REMAINDER_TAG feed this
 # script's query pool (see build_open_ended_query) -- any backorder-descended
@@ -135,6 +136,24 @@ MIN_BACKORDER_HOLD_VALUE = env_decimal("MIN_BACKORDER_HOLD_VALUE", default="75")
 # already under MIN_SPLIT_VALUE at creation.
 SPLIT_REMAINDER_TAG = env_first("SPLIT_REMAINDER_TAG", default="split-remainder") or "split-remainder"
 SPLIT_150_TAG = env_first("SPLIT_150_TAG", default="split-150") or "split-150"
+
+# ORPHAN RECOVERY (2026-09-24): backorder children that never received a
+# value-band tag (legacy pipeline, a failed post-verification tag call, a job
+# killed mid-split, etc.) were invisible to every pipeline forever. These
+# marker tags pull them back into the pool; process_draft then backfills the
+# missing band tag from the draft's own current total so they're never
+# orphaned again. split0 is deliberately NOT a marker -- original split0
+# drafts belong to shopify-adjust-orders-v2.py.
+ORPHAN_POOL_TAGS: List[str] = sorted(parse_csv_set(
+    env_first(
+        "ORPHAN_POOL_TAGS",
+        default="split-backorder-child,split1,split2,split3,split4,split5",
+    )
+))
+
+# v2's own lock tag. Excluded from the pool so a widened query can never grab
+# a draft v2 is mid-way through processing.
+V2_PROCESSING_TAG = env_first("V2_PROCESSING_TAG", default="v2-processing") or "v2-processing"
 
 # Identity/allow-list tag stamped once by shopify-orders-all-open.py on every
 # NEW draft at creation. It marks "this is an original split0 PO" and is
@@ -154,9 +173,9 @@ PROCESSING_TAG = env_first("BO_PROCESSING_TAG", default="bo-split-processing") o
 NEEDS_REVIEW_TAG = env_first("NEEDS_REVIEW_TAG", default="needs-review") or "needs-review"
 
 # Generation display tags: split1 -> split2 -> split3 ... Purely descriptive/
-# reporting. NOT used for querying (see SPLIT_150_TAG above) and NOT used to
-# gate any decision -- only to label which generation a draft is on, mirroring
-# the PO suffix depth.
+# reporting. NOT used to gate any decision -- only to label which generation
+# a draft is on, mirroring the PO suffix depth. (split1..splitN ARE used as
+# orphan-recovery markers in the query pool -- see ORPHAN_POOL_TAGS.)
 GENERATION_TAG_RE = re.compile(r"^split(\d+)$", re.IGNORECASE)
 
 
@@ -257,11 +276,13 @@ SHIP_DATE_WINDOW_DAYS = env_int("SHIP_DATE_WINDOW_DAYS", default=7)
 print("SHOPIFY_SHOP =", SHOP)
 print("API_VERSION  =", API_VERSION)
 print("DRY_RUN =", DRY_RUN)
+print("MAX_DRAFTS =", MAX_DRAFTS)
 print("MIN_SPLIT_VALUE (keep-side gate, split-150) =", MIN_SPLIT_VALUE)
 print("MIN_SPLIT_VALUE_REMAINDER (keep-side gate, split-remainder) =", MIN_SPLIT_VALUE_REMAINDER)
-print("MIN_BACKORDER_HOLD_VALUE (backorder hold gate) =", MIN_BACKORDER_HOLD_VALUE)
-print("SPLIT_150_TAG (also = query pool filter) =", SPLIT_150_TAG)
-print("SPLIT_REMAINDER_TAG =", SPLIT_REMAINDER_TAG)
+print("SPLIT_150_TAG (query pool) =", SPLIT_150_TAG)
+print("SPLIT_REMAINDER_TAG (query pool) =", SPLIT_REMAINDER_TAG)
+print("ORPHAN_POOL_TAGS (query pool, band backfilled) =", ORPHAN_POOL_TAGS)
+print("V2_PROCESSING_TAG (excluded from pool) =", V2_PROCESSING_TAG)
 print("SPLIT0_TAG (stripped from children) =", SPLIT0_TAG)
 print("LAUNCH_TAG_PREFIX =", LAUNCH_TAG_PREFIX)
 print("PROCESSING_TAG =", PROCESSING_TAG)
@@ -385,9 +406,14 @@ def gql(query: str, variables: Optional[Dict[str, Any]] = None, *, attempts: int
     raise RuntimeError(f"GraphQL call failed after {attempts} attempts: {last_err}")
 
 
+# reverse:false = OLDEST FIRST (2026-09-24). Was reverse:true (newest first),
+# which meant the longest-waiting drafts were evaluated last -- up to ~50 min
+# into the run -- after anything running concurrently had already committed
+# stock. Oldest-first is FIFO: the drafts that have waited longest see stock
+# first. Also means a MAX_DRAFTS truncation drops the newest, not the oldest.
 QUERY_DRAFTS = """
 query($first:Int!, $after:String, $query:String) {
-  draftOrders(first:$first, after:$after, query:$query, reverse:true) {
+  draftOrders(first:$first, after:$after, query:$query, reverse:false) {
     edges { cursor node { id name tags } }
     pageInfo { hasNextPage endCursor }
   }
@@ -416,6 +442,7 @@ query($id:ID!, $locationId:ID!, $shipDateNamespace: String!, $shipDateKey: Strin
       nodes {
         quantity
         title
+        sku
         appliedDiscount {
           description title value valueType
           amountV2 { amount currencyCode }
@@ -725,6 +752,25 @@ def classify_lines(lines: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], L
     return keep, backorder
 
 
+def backorder_reason(line: Dict[str, Any]) -> str:
+    """
+    Diagnostic only -- mirrors classify_lines' decision so every no-op/split
+    log line says exactly WHY each line landed on the backorder side.
+    """
+    label = line.get("sku") or line.get("title") or "?"
+    if has_launch_tag(line):
+        return f"{label}(launch)"
+    qty = int(line.get("quantity") or 0)
+    variant = line.get("variant") or {}
+    inv_item = variant.get("inventoryItem") or {}
+    if not inv_item.get("inventoryLevel"):
+        return f"{label}(not stocked at location, need {qty})"
+    available = get_available_qty(line)
+    if not available or available <= 0:
+        return f"{label}(0/{qty})"
+    return f"{label}(partial {available}/{qty})"
+
+
 def sum_value(lines: List[Dict[str, Any]]) -> Decimal:
     total = Decimal("0")
     for line in lines:
@@ -746,6 +792,14 @@ def required_keep_value(tags: List[str]) -> Decimal:
     if SPLIT_REMAINDER_TAG in (tags or []):
         return MIN_SPLIT_VALUE_REMAINDER
     return MIN_SPLIT_VALUE
+
+
+def has_band_tag(tags: List[str]) -> bool:
+    return SPLIT_150_TAG in (tags or []) or SPLIT_REMAINDER_TAG in (tags or [])
+
+
+def has_orphan_marker(tags: List[str]) -> bool:
+    return bool(set(tags or []) & set(ORPHAN_POOL_TAGS))
 
 
 # ----------------------------
@@ -858,6 +912,45 @@ def release_processing_lock(draft_id: str, tags: List[str], order_discount_input
 
 
 # ----------------------------
+# STALE LOCK SWEEP (2026-09-24)
+# ----------------------------
+def sweep_stale_locks() -> List[str]:
+    """
+    A job killed mid-draft (timeout, runner loss, cancel) leaves that draft
+    wearing PROCESSING_TAG, and the pool query excludes that tag -- so the
+    draft silently drops out of the pipeline forever (e.g. #D29039). At the
+    start of a run, any draft still carrying this script's lock is by
+    definition stale: the workflow's concurrency group guarantees no other
+    run of THIS script is active. Only this script's own lock is touched;
+    v2-processing is never swept here.
+    """
+    swept: List[str] = []
+    after = None
+    query = f"status:open tag:{PROCESSING_TAG}"
+    while True:
+        resp = gql(QUERY_DRAFTS, {"first": 100, "after": after, "query": query}).get("draftOrders") or {}
+        edges = resp.get("edges") or []
+        for e in edges:
+            node = e.get("node") or {}
+            if not node or PROCESSING_TAG not in (node.get("tags") or []):
+                continue
+            name = node.get("name") or node.get("id")
+            try:
+                detail = fetch_draft_detail(node["id"])
+                discount = applied_discount_input(detail.get("appliedDiscount"))
+                release_processing_lock(node["id"], list(detail.get("tags") or []), discount)
+                logger.warning("%s: released STALE '%s' lock left by an earlier run.", name, PROCESSING_TAG)
+                swept.append(name)
+            except Exception as ex:
+                logger.error("%s: could not release stale lock: %s", name, ex)
+        page_info = resp.get("pageInfo") or {}
+        after = page_info.get("endCursor")
+        if not edges or not page_info.get("hasNextPage"):
+            break
+    return swept
+
+
+# ----------------------------
 # DRAFT PROCESSOR
 # ----------------------------
 def process_draft(draft_id: str) -> str:
@@ -869,15 +962,20 @@ def process_draft(draft_id: str) -> str:
     order_discount_input = applied_discount_input(draft.get("appliedDiscount"))
 
     # Defensive re-check even though the query already filters on this --
-    # belt and suspenders, same philosophy as v2's allow-list check.
-    if SPLIT_150_TAG not in existing_tags and SPLIT_REMAINDER_TAG not in existing_tags:
-        logger.info("%s: SKIP (missing '%s'/'%s' tag).", name, SPLIT_150_TAG, SPLIT_REMAINDER_TAG)
+    # belt and suspenders, same philosophy as v2's allow-list check. A draft
+    # with no band tag is still eligible if it carries an orphan marker; its
+    # band is backfilled below after the lock is claimed.
+    if not has_band_tag(existing_tags) and not has_orphan_marker(existing_tags):
+        logger.info("%s: SKIP (no band tag and no orphan marker).", name)
         return "skipped"
     if NEEDS_REVIEW_TAG in existing_tags:
         logger.info("%s: SKIP (tag '%s' present).", name, NEEDS_REVIEW_TAG)
         return "skipped"
     if PROCESSING_TAG in existing_tags:
         logger.info("%s: SKIP (tag '%s' present — concurrent run?).", name, PROCESSING_TAG)
+        return "skipped"
+    if V2_PROCESSING_TAG in existing_tags:
+        logger.info("%s: SKIP (tag '%s' present — v2 is processing it).", name, V2_PROCESSING_TAG)
         return "skipped"
 
     excluded, exclusion_reasons = is_excluded_draft(draft)
@@ -903,11 +1001,21 @@ def process_draft(draft_id: str) -> str:
         lines = (live.get("lineItems") or {}).get("nodes") or []
         original_tags = list(live.get("tags") or [])
 
+        # ORPHAN BAND BACKFILL: assign the missing value-band tag from this
+        # draft's own current total. Added to original_tags so it persists
+        # through whichever update runs next (lock release on no-op/resolved,
+        # parent update on split). The child still strips both band tags and
+        # gets its own after verification, exactly as before.
+        if not has_band_tag(original_tags):
+            backfill_band = pick_split_band_tag(sum_value(lines))
+            original_tags = with_tag(original_tags, backfill_band)
+            logger.warning("%s: orphan (no band tag) — backfilled '%s' from own total %s.", name, backfill_band, sum_value(lines))
+
         keep_lines, backorder_lines = classify_lines(lines)
 
         # CASE 3: fully resolved. Nothing here to do -- check-draft-orders.py
         # and release-instock-orders.py handle it independently from here.
-        # No tag changes at all, per design.
+        # No tag changes at all, per design (other than an orphan backfill).
         if not backorder_lines:
             logger.info("%s: no backorder lines remain. Leaving for check-draft-orders.py.", name)
             release_processing_lock(draft_id, original_tags, order_discount_input)
@@ -918,22 +1026,26 @@ def process_draft(draft_id: str) -> str:
         keep_value = sum_value(keep_lines)
         bo_value = sum_value(backorder_lines)
         keep_ok = keep_value >= keep_threshold
-        bo_hold_ok = bo_value >= MIN_BACKORDER_HOLD_VALUE
 
         logger.info(
-            "%s: projected keep=%s (ok=%s @ $%s) backorder=%s (hold_ok=%s @ $%s)",
-            name, keep_value, keep_ok, keep_threshold, bo_value, bo_hold_ok, MIN_BACKORDER_HOLD_VALUE,
+            "%s: projected keep=%s (ok=%s @ $%s) backorder=%s",
+            name, keep_value, keep_ok, keep_threshold, bo_value,
+        )
+        logger.info(
+            "%s: backorder lines: %s",
+            name, ", ".join(backorder_reason(l) for l in backorder_lines),
         )
 
-        # CASE 1: nothing clears the gate yet. No-op, no tag change, try
-        # again tomorrow -- this is NOT terminal, unlike v2's initial eval.
-        if not keep_ok or not bo_hold_ok:
+        # CASE 1: not enough releasable product yet. No-op, no tag change,
+        # try again tomorrow -- this is NOT terminal, unlike v2's initial eval.
+        # Keep side is the ONLY gate; backorder value never blocks a split.
+        if not keep_ok:
             logger.info("%s: gate not cleared, no split attempted. Leaving as-is.", name)
             release_processing_lock(draft_id, original_tags, order_discount_input)
             processing_released = True
             return "no-op"
 
-        # --- both gates cleared: attempt the split ---
+        # --- keep gate cleared: attempt the split ---
         root_po, root_draft_id = get_root_linkage(live)
         own_new_po = build_next_po_number(live.get("poNumber") or "")
         parent_generation = current_generation_number(original_tags)
@@ -1002,23 +1114,22 @@ def process_draft(draft_id: str) -> str:
 
         # --- verify actual totals ---
         if DRY_RUN:
-            actual_keep_ok, actual_bo_hold_ok, actual_bo_value = keep_ok, bo_hold_ok, bo_value
+            actual_keep_ok, actual_bo_value = keep_ok, bo_value
         else:
             refreshed_parent = fetch_draft_detail(draft_id)
             refreshed_child = fetch_draft_detail(child["id"])
             actual_keep_value = sum_value((refreshed_parent.get("lineItems") or {}).get("nodes") or [])
             actual_bo_value = sum_value((refreshed_child.get("lineItems") or {}).get("nodes") or [])
             actual_keep_ok = actual_keep_value >= keep_threshold
-            actual_bo_hold_ok = actual_bo_value >= MIN_BACKORDER_HOLD_VALUE
             logger.info(
-                "%s: actual keep=%s (ok=%s) backorder=%s (hold_ok=%s)",
-                name, actual_keep_value, actual_keep_ok, actual_bo_value, actual_bo_hold_ok,
+                "%s: actual keep=%s (ok=%s) backorder=%s",
+                name, actual_keep_value, actual_keep_ok, actual_bo_value,
             )
 
-        if not actual_keep_ok or not actual_bo_hold_ok:
+        if not actual_keep_ok:
             # Unwind: NOT terminal here, unlike v2. No tag applied -- just
             # revert and try again tomorrow.
-            logger.warning("%s: actual values failed the gate post-verification, unwinding (no tag change).", name)
+            logger.warning("%s: actual keep value failed the gate post-verification, unwinding (no tag change).", name)
             draft_delete(child["id"], label="unwind child (actual values below threshold)")
             restore_input = with_order_discount({"lineItems": [build_line_input(l) for l in original_lines]}, order_discount_input)
             draft_update_return(draft_id, restore_input, label="restore parent lines after unwind")
@@ -1030,11 +1141,16 @@ def process_draft(draft_id: str) -> str:
         band_tag = pick_split_band_tag(actual_bo_value)
         child_current_tags = list(child.get("tags") or [])
         if band_tag not in child_current_tags:
-            child = draft_update_return(
+            band_errs, band_child = draft_update_return(
                 child["id"],
                 with_order_discount({"tags": with_tag(child_current_tags, band_tag)}, order_discount_input),
                 label=f"tag child {band_tag}",
-            )[1] or child
+            )
+            if band_errs:
+                # Not fatal: the child still carries its generation tag, so
+                # the orphan pool picks it up next run and backfills the band.
+                logger.warning("%s: could not tag child with '%s' (%s) — orphan recovery will backfill next run.", name, band_tag, band_errs)
+            child = band_child or child
 
         logger.info("%s: split succeeded (child %s, %s, backorder=%s).", name, child.get("name") or child.get("id"), band_tag, actual_bo_value)
         processing_released = True
@@ -1055,18 +1171,24 @@ def chunk_list(items: List[str], size: int) -> List[List[str]]:
     return [items[i:i + size] for i in range(0, len(items), size)]
 
 
+def pool_tag_clause() -> str:
+    tags = [SPLIT_150_TAG, SPLIT_REMAINDER_TAG] + [t for t in ORPHAN_POOL_TAGS if t not in (SPLIT_150_TAG, SPLIT_REMAINDER_TAG)]
+    return "(" + " OR ".join(f"tag:{t}" for t in tags) + ")"
+
+
 def build_open_ended_query() -> str:
     # The ENTIRE pool for this script: open drafts tagged with either value
-    # band (split-150 or split-remainder), minus needs-review and minus
-    # anything currently locked by a concurrent run. Deliberately NO
-    # generation-tag enumeration and NO "already evaluated" exclusion --
-    # every eligible draft gets walked every run, forever, per the
-    # no-shortcut-exclusion principle.
+    # band (split-150 or split-remainder) OR any orphan-recovery marker
+    # (backorder children missing a band tag), minus needs-review, minus
+    # anything locked by this script or by v2. Deliberately NO "already
+    # evaluated" exclusion -- every eligible draft gets walked every run,
+    # forever, per the no-shortcut-exclusion principle.
     parts = [
         "status:open",
-        f"(tag:{SPLIT_150_TAG} OR tag:{SPLIT_REMAINDER_TAG})",
+        pool_tag_clause(),
         f"-tag:{NEEDS_REVIEW_TAG}",
         f"-tag:{PROCESSING_TAG}",
+        f"-tag:{V2_PROCESSING_TAG}",
     ]
     return " ".join(parts)
 
@@ -1075,12 +1197,14 @@ def main() -> None:
     targets = {normalize_draft_name(n) for n in DRAFT_ORDER_NAMES} if DRAFT_ORDER_NAMES else set()
     collected: List[Dict[str, Any]] = []
     scanned = 0
+    truncated = False
+    swept: List[str] = []
 
     if DRAFT_ORDER_NAMES:
         for chunk in chunk_list(DRAFT_ORDER_NAMES, 12):
             name_query = build_draft_name_query(chunk)
-            # Even in scoped test mode, still require one of the value-band tags.
-            band_clause = f"(tag:{SPLIT_150_TAG} OR tag:{SPLIT_REMAINDER_TAG})"
+            # Even in scoped test mode, still require a pool tag.
+            band_clause = pool_tag_clause()
             query = f"status:open {band_clause} ({name_query})" if name_query else f"status:open {band_clause}"
             after = None
             while True:
@@ -1098,6 +1222,10 @@ def main() -> None:
                 if not page_info.get("hasNextPage"):
                     break
     else:
+        # Clear locks orphaned by a killed previous run BEFORE building the
+        # pool, so those drafts are evaluated tonight instead of never.
+        swept = sweep_stale_locks()
+
         query = build_open_ended_query()
         logger.info("Open-ended query: %s", query)
         page_size = min(250, MAX_DRAFTS)
@@ -1114,12 +1242,19 @@ def main() -> None:
                     scanned += 1
                     if scanned >= MAX_DRAFTS:
                         break
-            if scanned >= MAX_DRAFTS:
-                break
             page_info = resp.get("pageInfo") or {}
+            if scanned >= MAX_DRAFTS:
+                truncated = bool(page_info.get("hasNextPage")) or len(edges) > 0
+                break
             after = page_info.get("endCursor")
             if not page_info.get("hasNextPage"):
                 break
+
+        if truncated:
+            logger.warning(
+                "POOL TRUNCATED: hit MAX_DRAFTS=%s — the newest drafts beyond this were NOT evaluated this run. Raise MAX_DRAFTS.",
+                MAX_DRAFTS,
+            )
 
     if not collected:
         logger.info("No drafts found.")
@@ -1149,6 +1284,11 @@ def main() -> None:
 
     logger.info("")
     logger.info("Run summary")
+    if swept:
+        logger.info("STALE LOCKS RELEASED: %s", len(swept))
+        logger.info("  %s", ", ".join(swept))
+    if truncated:
+        logger.info("POOL TRUNCATED AT MAX_DRAFTS=%s — raise it.", MAX_DRAFTS)
     for key, names in outcomes.items():
         logger.info("%s: %s", key.upper(), len(names))
         if names:
