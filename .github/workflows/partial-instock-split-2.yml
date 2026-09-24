@@ -3,7 +3,15 @@ name: Partial Instock Split (Nightly)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 8 * * *"
+    # 07:23 UTC = 12:23 AM MST (Phoenix, no DST). Deliberately off the top of
+    # the hour -- GitHub delays :00 schedules heavily (was starting 4-7h late).
+    - cron: "23 7 * * *"
+
+# Only one run at a time. Required by the stale-lock sweep in
+# partial-instock-split-2.py, which assumes no other run of this script is active.
+concurrency:
+  group: partial-instock-split
+  cancel-in-progress: false
 
 jobs:
   run-partial-split:
@@ -31,21 +39,23 @@ jobs:
           SHOPIFY_SHOP: ${{ secrets.SHOPIFY_SHOP }}
           SHOPIFY_LOCATION_ID: ${{ secrets.SHOPIFY_LOCATION_ID }}
           DRY_RUN: ${{ vars.DRY_RUN }}
+          MAX_DRAFTS: ${{ vars.MAX_DRAFTS }}
           MIN_SPLIT_VALUE: ${{ vars.MIN_SPLIT_VALUE }}
           MIN_SPLIT_VALUE_REMAINDER: ${{ vars.MIN_SPLIT_VALUE_REMAINDER }}
-          MIN_BACKORDER_HOLD_VALUE: ${{ vars.MIN_BACKORDER_HOLD_VALUE }}
           SPLIT_150_TAG: ${{ vars.SPLIT_150_TAG }}
           BO_PROCESSING_TAG: ${{ vars.BO_PROCESSING_TAG }}
+          V2_PROCESSING_TAG: ${{ vars.V2_PROCESSING_TAG }}
         run: |
           echo "SHOPIFY_ADMIN_ACCESS_TOKEN set? -> $([[ -n "$SHOPIFY_ADMIN_ACCESS_TOKEN" ]] && echo YES || echo NO)"
           echo "SHOPIFY_SHOP set? -> $([[ -n "$SHOPIFY_SHOP" ]] && echo YES || echo NO)"
           echo "SHOPIFY_LOCATION_ID set? -> $([[ -n "$SHOPIFY_LOCATION_ID" ]] && echo YES || echo NO)"
           echo "DRY_RUN -> ${DRY_RUN:-MISSING}"
+          echo "MAX_DRAFTS -> ${MAX_DRAFTS:-MISSING}"
           echo "MIN_SPLIT_VALUE -> ${MIN_SPLIT_VALUE:-MISSING}"
           echo "MIN_SPLIT_VALUE_REMAINDER -> ${MIN_SPLIT_VALUE_REMAINDER:-MISSING}"
-          echo "MIN_BACKORDER_HOLD_VALUE -> ${MIN_BACKORDER_HOLD_VALUE:-MISSING}"
           echo "SPLIT_150_TAG -> ${SPLIT_150_TAG:-MISSING}"
           echo "BO_PROCESSING_TAG -> ${BO_PROCESSING_TAG:-MISSING}"
+          echo "V2_PROCESSING_TAG -> ${V2_PROCESSING_TAG:-MISSING (script default: v2-processing)}"
 
       - name: Run nightly partial-instock split
         env:
@@ -60,17 +70,19 @@ jobs:
 
           # Deliberately NOT mapping DRAFT_ORDER_NAMES here -- see note above.
 
-          # --- gate thresholds ---
+          # --- keep-side gates (the ONLY value gates; backorder hold gate removed 2026-09-24) ---
           MIN_SPLIT_VALUE: ${{ vars.MIN_SPLIT_VALUE }}
           MIN_SPLIT_VALUE_REMAINDER: ${{ vars.MIN_SPLIT_VALUE_REMAINDER }}
-          MIN_BACKORDER_HOLD_VALUE: ${{ vars.MIN_BACKORDER_HOLD_VALUE }}
 
-          # --- value-band tags (SPLIT_150_TAG and SPLIT_REMAINDER_TAG together drive this script's entire query pool) ---
+          # --- query pool: value-band tags + orphan-recovery markers ---
           SPLIT_150_TAG: ${{ vars.SPLIT_150_TAG }}
           SPLIT_REMAINDER_TAG: ${{ vars.SPLIT_REMAINDER_TAG }}
+          ORPHAN_POOL_TAGS: ${{ vars.ORPHAN_POOL_TAGS }}
+          SPLIT0_TAG: ${{ vars.SPLIT0_TAG }}
 
-          # --- this script's own concurrency lock, separate from v2-processing ---
+          # --- locks: this script's own (swept at run start if stale) + v2's (excluded from pool) ---
           BO_PROCESSING_TAG: ${{ vars.BO_PROCESSING_TAG }}
+          V2_PROCESSING_TAG: ${{ vars.V2_PROCESSING_TAG }}
 
           NEEDS_REVIEW_TAG: ${{ vars.NEEDS_REVIEW_TAG }}
           LAUNCH_TAG_PREFIX: ${{ vars.LAUNCH_TAG_PREFIX }}
