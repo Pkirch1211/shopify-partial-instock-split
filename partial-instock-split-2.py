@@ -983,6 +983,13 @@ def process_draft(draft_id: str) -> str:
         logger.info("%s: SKIP (excluded customer: %s).", name, " ; ".join(exclusion_reasons))
         return "skipped"
 
+    # Empty drafts (every line removed) can't be updated at all -- Shopify
+    # rejects any draftOrderUpdate with "Add at least 1 product", so the lock
+    # claim itself fails. Nothing to split; flag for a human instead.
+    if not ((draft.get("lineItems") or {}).get("nodes") or []):
+        logger.warning("%s: SKIP (draft has no line items — delete or fix manually).", name)
+        return "skipped"
+
     raw_ship_date = ((draft.get("ship_date_meta") or {}).get("value") or "").strip()
     if not ship_date_is_eligible(raw_ship_date):
         logger.info("%s: SKIP (ship date %r not yet eligible).", name, raw_ship_date)
@@ -1024,12 +1031,11 @@ def process_draft(draft_id: str) -> str:
 
         keep_threshold = required_keep_value(original_tags)
         keep_value = sum_value(keep_lines)
-        bo_value = sum_value(backorder_lines)
         keep_ok = keep_value >= keep_threshold
 
         logger.info(
-            "%s: projected keep=%s (ok=%s @ $%s) backorder=%s",
-            name, keep_value, keep_ok, keep_threshold, bo_value,
+            "%s: projected keep=%s (ok=%s @ $%s)",
+            name, keep_value, keep_ok, keep_threshold,
         )
         logger.info(
             "%s: backorder lines: %s",
@@ -1114,7 +1120,9 @@ def process_draft(draft_id: str) -> str:
 
         # --- verify actual totals ---
         if DRY_RUN:
-            actual_keep_ok, actual_bo_value = keep_ok, bo_value
+            # Child value here is ONLY used to pick its band tag below --
+            # never as a gate.
+            actual_keep_ok, actual_bo_value = keep_ok, sum_value(backorder_lines)
         else:
             refreshed_parent = fetch_draft_detail(draft_id)
             refreshed_child = fetch_draft_detail(child["id"])
