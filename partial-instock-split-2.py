@@ -554,6 +554,23 @@ def with_order_discount(input_data: Dict[str, Any], order_discount_input: Option
     return input_data
 
 
+def child_order_discount(order_discount_input: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    The order-level discount a backorder CHILD should carry (2026-09-28).
+    PERCENTAGE discounts carry down every generation -- they scale with
+    whatever lines the child holds. FIXED_AMOUNT discounts stay on the
+    parent only: a flat $ off was entered against the original draft, and
+    copying it onto every child would re-apply it once per split. Returns
+    None for fixed (or no) discount, which the child update sends as an
+    explicit null to clear the copy draftOrderDuplicate made.
+    """
+    if not order_discount_input:
+        return None
+    if str(order_discount_input.get("valueType") or "").upper() == "PERCENTAGE":
+        return order_discount_input
+    return None
+
+
 def merge_custom_attributes(existing: List[Dict[str, Any]], additions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     merged: Dict[str, str] = {}
     for item in existing or []:
@@ -1060,6 +1077,15 @@ def process_draft(draft_id: str) -> str:
         original_metafields = (live.get("metafields") or {}).get("nodes") or []
         original_lines = list(lines)
 
+        # Child gets PERCENTAGE order discounts only; FIXED_AMOUNT stays on
+        # the parent (2026-09-28). See child_order_discount.
+        child_discount_input = child_order_discount(order_discount_input)
+        if order_discount_input and not child_discount_input:
+            logger.info(
+                "%s: order discount is %s (not PERCENTAGE) — kept on parent, NOT carried to child.",
+                name, order_discount_input.get("valueType"),
+            )
+
         try:
             child = draft_duplicate(draft_id)
         except Exception as e:
@@ -1087,22 +1113,24 @@ def process_draft(draft_id: str) -> str:
                 ),
             )
             child_base_tags = strip_generation_tags(child_base_tags)
-            child_input = with_order_discount(
-                {
-                    "lineItems": [build_line_input(l) for l in backorder_lines],
-                    "poNumber": own_new_po,
-                    "tags": with_tag(child_base_tags, child_generation_tag),
-                    "customAttributes": merge_custom_attributes(original_custom_attributes, ca_add),
-                    "metafields": merge_metafields(original_metafields, mf_add),
-                },
-                order_discount_input,
-            )
+            # appliedDiscount is set EXPLICITLY on the child: the percentage
+            # discount, or null to clear the fixed-amount discount that
+            # draftOrderDuplicate copied over from the parent.
+            child_input = {
+                "lineItems": [build_line_input(l) for l in backorder_lines],
+                "poNumber": own_new_po,
+                "tags": with_tag(child_base_tags, child_generation_tag),
+                "customAttributes": merge_custom_attributes(original_custom_attributes, ca_add),
+                "metafields": merge_metafields(original_metafields, mf_add),
+                "appliedDiscount": child_discount_input,
+            }
             child = draft_update_return(child["id"], child_input, label="child (backorder) update")[1] or child
 
             # Parent keeps ONLY the newly-shippable lines and releases the
             # lock in the same call. Every other tag (including its own
             # generation tag, split0, and value-band tag) is left completely
-            # untouched, per design.
+            # untouched, per design. Parent keeps its order discount
+            # regardless of type.
             parent_input = with_order_discount(
                 {
                     "lineItems": [build_line_input(l) for l in keep_lines],
@@ -1151,7 +1179,7 @@ def process_draft(draft_id: str) -> str:
         if band_tag not in child_current_tags:
             band_errs, band_child = draft_update_return(
                 child["id"],
-                with_order_discount({"tags": with_tag(child_current_tags, band_tag)}, order_discount_input),
+                with_order_discount({"tags": with_tag(child_current_tags, band_tag)}, child_discount_input),
                 label=f"tag child {band_tag}",
             )
             if band_errs:
