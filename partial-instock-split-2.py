@@ -147,7 +147,7 @@ SPLIT_150_TAG = env_first("SPLIT_150_TAG", default="split-150") or "split-150"
 ORPHAN_POOL_TAGS: List[str] = sorted(parse_csv_set(
     env_first(
         "ORPHAN_POOL_TAGS",
-        default="split-backorder-child,split1,split2,split3,split4,split5",
+        default="split-backorder-child,split1,split2,split3,split4,split5,split6,split7,split8,split9",
     )
 ))
 
@@ -223,6 +223,43 @@ def build_next_po_number(current_po: str) -> str:
     return f"{base} - BO1" if base else "BACKORDER-1"
 
 
+def po_generation(po: str) -> Optional[int]:
+    """BO depth of a PO: 'X - BO2' -> 2. None if the PO has no BO suffix."""
+    match = PO_SUFFIX_RE.match((po or "").strip())
+    return int(match.group(2)) if match else None
+
+
+# Legacy backorder-child marker (pre-v2 pipeline). Still an orphan-pool
+# marker so old children get discovered, but never kept once a draft has a
+# proper generation tag, and never inherited by a new child.
+LEGACY_CHILD_TAG = "split-backorder-child"
+
+
+def heal_generation_tags(tags: List[str], po: str) -> List[str]:
+    """
+    Makes a backorder draft's generation tag mirror its OWN PO suffix
+    (2026-09-29): 'X - BO2' -> exactly one tag, split2. Removes split0 and
+    any other stray/duplicate generation tag (e.g. a split0 re-stamped by the
+    Shopify Flow on a duplicate) plus the legacy child marker. If the PO has
+    no BO suffix, falls back to the highest splitN (N >= 1) already present.
+    Returns the tags unchanged when there's nothing to anchor on.
+    """
+    want = po_generation(po)
+    if want is None:
+        gens = [
+            int(m.group(1))
+            for m in (GENERATION_TAG_RE.match(str(t).strip()) for t in (tags or []))
+            if m and int(m.group(1)) >= 1
+        ]
+        if not gens:
+            return list(tags or [])
+        want = max(gens)
+    healed = strip_generation_tags(tags)
+    healed = [t for t in healed if t != LEGACY_CHILD_TAG]
+    healed.append(generation_tag_for(want))
+    return healed
+
+
 # Exact-match / substring customer exclusions -- same mechanism/defaults as
 # shopify-adjust-orders-v2.py, applied identically here.
 EXCLUDED_CUSTOMERS = parse_csv_set(env_first("EXCLUDED_CUSTOMERS", default=""), casefold=True)
@@ -249,6 +286,18 @@ CONVERSION_TRIGGER_TAGS = parse_csv_set(
     env_first("CONVERSION_TRIGGER_TAGS", default="instock-ready"),
     casefold=False,
 )
+
+# Parent tags that must NOT be inherited by a backorder child (2026-09-29):
+# the legacy child marker and release-state flags that describe the
+# PARENT's release attempt. review-done is intentionally inherited.
+CHILD_STRIP_TAGS = parse_csv_set(
+    env_first("CHILD_STRIP_TAGS", default="split-backorder-child,low-supply,below-min-value,inventory-shortage"),
+    casefold=False,
+)
+
+# Lineage key: stamped on every MT-imported draft, inherited by every child.
+# Used by the duplicate-PO guard.
+MT_RECORD_TAG_PREFIX = "mt_recordID:"
 
 # Linking fields. LINK_CUSTOM_ATTR_* / ORIGINAL_DRAFT_ID_METAFIELD_* carry the
 # TRUE ROOT split0 order's PO/draft id forward through every generation,
@@ -489,6 +538,23 @@ mutation($id:ID!) {
   draftOrderDelete(input:{id:$id}) {
     deletedId
     userErrors { field message }
+  }
+}
+"""
+
+# Lineage lookups for the duplicate-PO guard (2026-09-29).
+QUERY_LINEAGE_DRAFTS = """
+query($query:String!) {
+  draftOrders(first:250, query:$query) {
+    edges { node { id name poNumber } }
+  }
+}
+"""
+
+QUERY_LINEAGE_ORDERS = """
+query($query:String!) {
+  orders(first:250, query:$query) {
+    edges { node { id name poNumber cancelledAt } }
   }
 }
 """
@@ -847,19 +913,29 @@ def draft_update_return(draft_id: str, input_data: Dict[str, Any], label: str) -
     return errs, d
 
 
-def draft_delete(draft_id: str, label: str) -> None:
+def draft_delete(draft_id: str, label: str) -> bool:
+    """
+    Returns True only when Shopify confirms the delete (deletedId present,
+    no userErrors). Callers MUST check this: a child that silently survives
+    a rollback/unwind is a duplicate order waiting to ship (2026-09-29).
+    """
     if DRY_RUN:
         logger.info("DRY RUN — would delete %s: %s", label, draft_id)
-        return
+        return True
     try:
         res = gql(MUTATION_DELETE, {"id": draft_id})["draftOrderDelete"]
         errs = res.get("userErrors") or []
         if errs:
             logger.warning("draftOrderDelete userErrors (%s): %s", label, errs)
-        else:
-            logger.info("Deleted %s: %s", label, draft_id)
+            return False
+        if not res.get("deletedId"):
+            logger.warning("draftOrderDelete returned no deletedId (%s): %s", label, draft_id)
+            return False
+        logger.info("Deleted %s: %s", label, draft_id)
+        return True
     except Exception as e:
         logger.warning("Failed to delete %s %s: %s", label, draft_id, e)
+        return False
 
 
 # ----------------------------
@@ -929,6 +1005,125 @@ def release_processing_lock(draft_id: str, tags: List[str], order_discount_input
 
 
 # ----------------------------
+# LINEAGE / DUPLICATE GUARD HELPERS (2026-09-29)
+# ----------------------------
+def norm_po(po: Optional[str]) -> str:
+    return re.sub(r"[#\s]", "", str(po or "")).upper()
+
+
+def mt_record_tag(tags: List[str]) -> Optional[str]:
+    for t in tags or []:
+        if str(t).startswith(MT_RECORD_TAG_PREFIX):
+            return str(t)
+    return None
+
+
+def lineage_po_conflicts(self_id: str, tags: List[str], pos: List[Optional[str]]) -> Optional[List[str]]:
+    """
+    Duplicate-PO guard. Every draft in an MT lineage shares one mt_recordID
+    tag and every member has a unique PO (root, root - BO1, root - BO2 ...).
+    Returns the OTHER open drafts / non-cancelled orders in this lineage
+    whose PO matches any of `pos` -- a match means a duplicate or orphan
+    already exists. Returns None when the lineage can't be checked (no
+    mt_recordID tag). Raises on lookup failure: callers fail closed.
+    """
+    rec = mt_record_tag(tags)
+    if not rec:
+        return None
+    targets = {norm_po(p) for p in pos if p and norm_po(p)}
+    if not targets:
+        return []
+    tag_clause = f'tag:"{rec}"'
+    conflicts: List[str] = []
+    data = gql(QUERY_LINEAGE_DRAFTS, {"query": f"status:open {tag_clause}"})
+    for e in (data.get("draftOrders") or {}).get("edges") or []:
+        n = e.get("node") or {}
+        if n.get("id") != self_id and norm_po(n.get("poNumber")) in targets:
+            conflicts.append(f"open draft {n.get('name')} (PO {n.get('poNumber')})")
+    data = gql(QUERY_LINEAGE_ORDERS, {"query": tag_clause})
+    for e in (data.get("orders") or {}).get("edges") or []:
+        n = e.get("node") or {}
+        if not n.get("cancelledAt") and norm_po(n.get("poNumber")) in targets:
+            conflicts.append(f"order {n.get('name')} (PO {n.get('poNumber')})")
+    return conflicts
+
+
+def line_qty_map(lines: List[Dict[str, Any]]) -> Dict[Tuple[str, str], int]:
+    out: Dict[Tuple[str, str], int] = {}
+    for line in lines or []:
+        variant = line.get("variant") or {}
+        key = ("variant", variant["id"]) if variant.get("id") else ("custom", str(line.get("title") or ""))
+        out[key] = out.get(key, 0) + int(line.get("quantity") or 0)
+    return out
+
+
+def conservation_errors(original: List[Dict[str, Any]], parent: List[Dict[str, Any]], child: List[Dict[str, Any]]) -> List[str]:
+    """
+    Post-split invariant: for every variant, parent qty + child qty must
+    equal the original qty. Anything else means a line was duplicated
+    (both drafts would ship it) or dropped.
+    """
+    want = line_qty_map(original)
+    got = line_qty_map(parent)
+    for k, q in line_qty_map(child).items():
+        got[k] = got.get(k, 0) + q
+    errs: List[str] = []
+    for k in sorted(set(want) | set(got)):
+        if want.get(k, 0) != got.get(k, 0):
+            errs.append(f"{k[1]}: original {want.get(k, 0)} vs parent+child {got.get(k, 0)}")
+    return errs
+
+
+def abort_split(
+    *,
+    name: str,
+    draft_id: str,
+    child_id: str,
+    original_lines: List[Dict[str, Any]],
+    parent_tags: List[str],
+    order_discount_input: Optional[Dict[str, Any]],
+    reason: str,
+    escalate: bool,
+) -> None:
+    """
+    Undo a split attempt without ever leaving two shippable copies:
+      1. delete the child (verified),
+      2. restore the parent's original lines (verified),
+      3. release the parent's lock -- or tag it needs-review when escalate
+         is set or either step above failed.
+    A child that can't be deleted is tagged needs-review so no downstream
+    script (check-draft / release) can ever complete it.
+    """
+    child_gone = draft_delete(child_id, label=f"rollback child ({reason})")
+    restored = True
+    try:
+        errs, _ = draft_update_return(
+            draft_id,
+            with_order_discount({"lineItems": [build_line_input(l) for l in original_lines]}, order_discount_input),
+            label="restore parent lines",
+        )
+        if errs:
+            restored = False
+            logger.error("%s: could not restore parent lines: %s", name, errs)
+    except Exception as e:
+        restored = False
+        logger.error("%s: could not restore parent lines: %s", name, e)
+
+    if not child_gone:
+        logger.error("%s: CRITICAL — child %s could not be deleted; tagging it '%s'.", name, child_id, NEEDS_REVIEW_TAG)
+        try:
+            child_tags = list((fetch_draft_detail(child_id) if not DRY_RUN else {}).get("tags") or parent_tags)
+        except Exception:
+            child_tags = list(parent_tags)
+        try_tag_needs_review(child_id, child_tags, reason=f"orphan child from failed split of {name}")
+
+    if escalate or not child_gone or not restored:
+        try_tag_needs_review(draft_id, parent_tags, reason=reason, order_discount_input=order_discount_input)
+    else:
+        release_processing_lock(draft_id, parent_tags, order_discount_input)
+
+
+# ----------------------------
 # STALE LOCK SWEEP (2026-09-24)
 # ----------------------------
 def sweep_stale_locks() -> List[str]:
@@ -940,6 +1135,13 @@ def sweep_stale_locks() -> List[str]:
     definition stale: the workflow's concurrency group guarantees no other
     run of THIS script is active. Only this script's own lock is touched;
     v2-processing is never swept here.
+
+    2026-09-29: a killed split can also leave an ORPHAN DUPLICATE wearing
+    this lock (draftOrderDuplicate copies the parent's tags, lock included).
+    Releasing that lock would turn the copy into a live backorder draft and
+    ship the same lines twice. So before releasing, the lineage is checked:
+    if another open draft / order shares this draft's PO, or the lineage
+    can't be checked, the draft is tagged needs-review instead.
     """
     swept: List[str] = []
     after = None
@@ -954,9 +1156,16 @@ def sweep_stale_locks() -> List[str]:
             name = node.get("name") or node.get("id")
             try:
                 detail = fetch_draft_detail(node["id"])
+                tags = list(detail.get("tags") or [])
                 discount = applied_discount_input(detail.get("appliedDiscount"))
-                release_processing_lock(node["id"], list(detail.get("tags") or []), discount)
-                logger.warning("%s: released STALE '%s' lock left by an earlier run.", name, PROCESSING_TAG)
+                conflicts = lineage_po_conflicts(node["id"], tags, [detail.get("poNumber")])
+                if conflicts is None or conflicts:
+                    why = "lineage can't be checked" if conflicts is None else "same PO as " + "; ".join(conflicts)
+                    logger.warning("%s: STALE '%s' lock — possible orphan duplicate (%s). Tagging '%s'.", name, PROCESSING_TAG, why, NEEDS_REVIEW_TAG)
+                    try_tag_needs_review(node["id"], tags, reason=f"stale lock: {why}", order_discount_input=discount)
+                else:
+                    release_processing_lock(node["id"], tags, discount)
+                    logger.warning("%s: released STALE '%s' lock left by an earlier run.", name, PROCESSING_TAG)
                 swept.append(name)
             except Exception as ex:
                 logger.error("%s: could not release stale lock: %s", name, ex)
@@ -1035,6 +1244,21 @@ def process_draft(draft_id: str) -> str:
             original_tags = with_tag(original_tags, backfill_band)
             logger.warning("%s: orphan (no band tag) — backfilled '%s' from own total %s.", name, backfill_band, sum_value(lines))
 
+        # GENERATION TAG HEAL (2026-09-29): make this draft's splitN mirror
+        # its own PO suffix (BO2 -> split2) and drop any stray split0 /
+        # duplicate generation tag / legacy marker. Persists through the
+        # next update exactly like the band backfill above.
+        healed_tags = heal_generation_tags(original_tags, live.get("poNumber") or "")
+        if set(healed_tags) != set(original_tags):
+            logger.warning(
+                "%s: healed generation tags %s -> %s (PO %r).",
+                name,
+                sorted(set(original_tags) - set(healed_tags)),
+                sorted(set(healed_tags) - set(original_tags)),
+                live.get("poNumber"),
+            )
+            original_tags = healed_tags
+
         keep_lines, backorder_lines = classify_lines(lines)
 
         # CASE 3: fully resolved. Nothing here to do -- check-draft-orders.py
@@ -1071,8 +1295,13 @@ def process_draft(draft_id: str) -> str:
         # --- keep gate cleared: attempt the split ---
         root_po, root_draft_id = get_root_linkage(live)
         own_new_po = build_next_po_number(live.get("poNumber") or "")
-        parent_generation = current_generation_number(original_tags)
-        child_generation_tag = generation_tag_for(parent_generation + 1)
+        # Child's generation tag is derived from its OWN new PO so the two
+        # always agree: PO '... - BO2' <-> split2 (2026-09-29). Falls back to
+        # parent tag + 1 only if the PO has no BO suffix (e.g. BACKORDER-1).
+        child_generation = po_generation(own_new_po)
+        if child_generation is None:
+            child_generation = current_generation_number(original_tags) + 1
+        child_generation_tag = generation_tag_for(child_generation)
         original_custom_attributes = live.get("customAttributes") or []
         original_metafields = (live.get("metafields") or {}).get("nodes") or []
         original_lines = list(lines)
@@ -1085,6 +1314,21 @@ def process_draft(draft_id: str) -> str:
                 "%s: order discount is %s (not PERCENTAGE) — kept on parent, NOT carried to child.",
                 name, order_discount_input.get("valueType"),
             )
+
+        # --- duplicate-PO guard (2026-09-29): before creating anything, make
+        # sure no other open draft / live order in this lineage already has
+        # this draft's PO (orphan duplicate) or the child PO we're about to
+        # create (an earlier split of this draft already happened). Lookup
+        # errors raise and fail closed (lock released in finally).
+        conflicts = lineage_po_conflicts(draft_id, original_tags, [live.get("poNumber"), own_new_po])
+        if conflicts:
+            reason = "possible duplicate: same PO as " + "; ".join(conflicts)
+            logger.error("%s: NOT splitting — %s. Tagging '%s'.", name, reason, NEEDS_REVIEW_TAG)
+            try_tag_needs_review(draft_id, original_tags, reason=reason, order_discount_input=order_discount_input)
+            processing_released = True
+            return "needs-review"
+        if conflicts is None:
+            logger.info("%s: no mt_recordID tag — lineage duplicate check skipped.", name)
 
         try:
             child = draft_duplicate(draft_id)
@@ -1110,7 +1354,7 @@ def process_draft(draft_id: str) -> str:
                 list(original_tags),
                 CONVERSION_TRIGGER_TAGS.union(
                     {PROCESSING_TAG, SPLIT0_TAG, SPLIT_150_TAG, SPLIT_REMAINDER_TAG}
-                ),
+                ).union(CHILD_STRIP_TAGS),
             )
             child_base_tags = strip_generation_tags(child_base_tags)
             # appliedDiscount is set EXPLICITLY on the child: the percentage
@@ -1124,7 +1368,13 @@ def process_draft(draft_id: str) -> str:
                 "metafields": merge_metafields(original_metafields, mf_add),
                 "appliedDiscount": child_discount_input,
             }
-            child = draft_update_return(child["id"], child_input, label="child (backorder) update")[1] or child
+            # userErrors are FATAL here (2026-09-29). Previously ignored: a
+            # rejected child update left the child as a full copy of the
+            # parent, which then shipped alongside it.
+            child_errs, child_updated = draft_update_return(child["id"], child_input, label="child (backorder) update")
+            if child_errs:
+                raise RuntimeError(f"child update userErrors: {child_errs}")
+            child = child_updated or child
 
             # Parent keeps ONLY the newly-shippable lines and releases the
             # lock in the same call. Every other tag (including its own
@@ -1138,11 +1388,16 @@ def process_draft(draft_id: str) -> str:
                 },
                 order_discount_input,
             )
-            draft_update_return(draft_id, parent_input, label="parent (ship-now) update")
-        except Exception:
-            logger.exception("%s: split mutation failed, rolling back child.", name)
-            draft_delete(child["id"], label="rollback child after failed update")
-            release_processing_lock(draft_id, original_tags, order_discount_input)
+            parent_errs, _ = draft_update_return(draft_id, parent_input, label="parent (ship-now) update")
+            if parent_errs:
+                raise RuntimeError(f"parent update userErrors: {parent_errs}")
+        except Exception as e:
+            logger.exception("%s: split mutation failed, rolling back.", name)
+            abort_split(
+                name=name, draft_id=draft_id, child_id=child["id"], original_lines=original_lines,
+                parent_tags=original_tags, order_discount_input=order_discount_input,
+                reason=f"split mutation failed: {e}", escalate=False,
+            )
             processing_released = True
             raise
 
@@ -1154,8 +1409,26 @@ def process_draft(draft_id: str) -> str:
         else:
             refreshed_parent = fetch_draft_detail(draft_id)
             refreshed_child = fetch_draft_detail(child["id"])
-            actual_keep_value = sum_value((refreshed_parent.get("lineItems") or {}).get("nodes") or [])
-            actual_bo_value = sum_value((refreshed_child.get("lineItems") or {}).get("nodes") or [])
+            parent_lines_now = (refreshed_parent.get("lineItems") or {}).get("nodes") or []
+            child_lines_now = (refreshed_child.get("lineItems") or {}).get("nodes") or []
+
+            # LINE CONSERVATION (2026-09-29): parent + child must add up to
+            # exactly the original, variant by variant. If not, a line is on
+            # both drafts (would ship twice) or neither -- undo and escalate.
+            cons_errs = conservation_errors(original_lines, parent_lines_now, child_lines_now)
+            if cons_errs:
+                reason = "line conservation failed after split: " + "; ".join(cons_errs)
+                logger.error("%s: %s — undoing split.", name, reason)
+                abort_split(
+                    name=name, draft_id=draft_id, child_id=child["id"], original_lines=original_lines,
+                    parent_tags=original_tags, order_discount_input=order_discount_input,
+                    reason=reason, escalate=True,
+                )
+                processing_released = True
+                return "needs-review"
+
+            actual_keep_value = sum_value(parent_lines_now)
+            actual_bo_value = sum_value(child_lines_now)
             actual_keep_ok = actual_keep_value >= keep_threshold
             logger.info(
                 "%s: actual keep=%s (ok=%s) backorder=%s",
@@ -1166,9 +1439,24 @@ def process_draft(draft_id: str) -> str:
             # Unwind: NOT terminal here, unlike v2. No tag applied -- just
             # revert and try again tomorrow.
             logger.warning("%s: actual keep value failed the gate post-verification, unwinding (no tag change).", name)
-            draft_delete(child["id"], label="unwind child (actual values below threshold)")
+            if not draft_delete(child["id"], label="unwind child (actual values below threshold)"):
+                # Child survived the unwind: never leave it next to a fully
+                # restored parent. Escalate both (2026-09-29).
+                abort_split(
+                    name=name, draft_id=draft_id, child_id=child["id"], original_lines=original_lines,
+                    parent_tags=original_tags, order_discount_input=order_discount_input,
+                    reason="unwind: child delete failed", escalate=True,
+                )
+                processing_released = True
+                return "needs-review"
             restore_input = with_order_discount({"lineItems": [build_line_input(l) for l in original_lines]}, order_discount_input)
-            draft_update_return(draft_id, restore_input, label="restore parent lines after unwind")
+            restore_errs, _ = draft_update_return(draft_id, restore_input, label="restore parent lines after unwind")
+            if restore_errs:
+                reason = f"unwind: parent line restore failed: {restore_errs}"
+                logger.error("%s: %s", name, reason)
+                try_tag_needs_review(draft_id, original_tags, reason=reason, order_discount_input=order_discount_input)
+                processing_released = True
+                return "needs-review"
             release_processing_lock(draft_id, original_tags, order_discount_input)
             processing_released = True
             return "unwound"
@@ -1307,7 +1595,7 @@ def main() -> None:
 
     logger.info("Found %s draft(s) after filtering. DRY_RUN=%s (scanned %s rows)", len(drafts), DRY_RUN, scanned)
 
-    outcomes: Dict[str, List[str]] = {"split": [], "resolved": [], "no-op": [], "unwound": [], "skipped": []}
+    outcomes: Dict[str, List[str]] = {"split": [], "resolved": [], "no-op": [], "unwound": [], "needs-review": [], "skipped": []}
     failed: List[Tuple[str, str]] = []
     for d in drafts:
         draft_name = d.get("name", d.get("id", "(unknown)"))
@@ -1321,7 +1609,7 @@ def main() -> None:
     logger.info("")
     logger.info("Run summary")
     if swept:
-        logger.info("STALE LOCKS RELEASED: %s", len(swept))
+        logger.info("STALE LOCKS HANDLED (released or escalated): %s", len(swept))
         logger.info("  %s", ", ".join(swept))
     if truncated:
         logger.info("POOL TRUNCATED AT MAX_DRAFTS=%s — raise it.", MAX_DRAFTS)
