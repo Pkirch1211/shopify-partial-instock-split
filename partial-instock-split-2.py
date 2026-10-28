@@ -260,9 +260,14 @@ def heal_generation_tags(tags: List[str], po: str) -> List[str]:
     return healed
 
 
-# Exact-match / substring customer exclusions -- same mechanism/defaults as
-# shopify-adjust-orders-v2.py, applied identically here.
+# Exact-match / substring customer exclusions -- same mechanism as
+# shopify-adjust-orders-v2.py.
 EXCLUDED_CUSTOMERS = parse_csv_set(env_first("EXCLUDED_CUSTOMERS", default=""), casefold=True)
+# 2026-10-28: DEFAULT_EXCLUDED_SUBSTRINGS is now a FALLBACK only, used when
+# EXCLUDED_CUSTOMER_SUBSTRINGS is unset/empty. Previously it was unioned in
+# on every run, so customers on this list could never be un-excluded via the
+# repo variable. If the variable is set, it is the complete list -- it must
+# include any of these defaults that should still be excluded.
 DEFAULT_EXCLUDED_SUBSTRINGS = {
     "faire",
     "faire marketplace",
@@ -277,8 +282,7 @@ DEFAULT_EXCLUDED_SUBSTRINGS = {
 EXCLUDED_CUSTOMER_SUBSTRINGS = parse_csv_set(
     env_first("EXCLUDED_CUSTOMER_SUBSTRINGS", default=""),
     casefold=True,
-) or set()
-EXCLUDED_CUSTOMER_SUBSTRINGS = set(EXCLUDED_CUSTOMER_SUBSTRINGS).union(DEFAULT_EXCLUDED_SUBSTRINGS)
+) or set(DEFAULT_EXCLUDED_SUBSTRINGS)
 
 # Tags that can cause other automations to convert a draft into an order.
 # Stripped before duplicating, same reasoning as v2.
@@ -337,6 +341,8 @@ print("LAUNCH_TAG_PREFIX =", LAUNCH_TAG_PREFIX)
 print("PROCESSING_TAG =", PROCESSING_TAG)
 print("NEEDS_REVIEW_TAG =", NEEDS_REVIEW_TAG)
 print("SHIP_DATE_WINDOW_DAYS =", SHIP_DATE_WINDOW_DAYS)
+print("EXCLUDED_CUSTOMERS (exact) =", sorted(EXCLUDED_CUSTOMERS))
+print("EXCLUDED_CUSTOMER_SUBSTRINGS =", sorted(EXCLUDED_CUSTOMER_SUBSTRINGS))
 
 if not SHOP or not TOKEN:
     raise SystemExit(
